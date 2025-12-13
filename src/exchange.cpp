@@ -1,6 +1,9 @@
 #pragma once
 #include "exchange.hpp"
 #include "time.hpp"
+#include "logging.hpp"
+
+TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
 Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
     : context_(context), 
@@ -280,6 +283,7 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
 void Exchange::on_message(Connection* from, Message_t message_type, const uint8_t* payload) {
     switch (static_cast<MessageType>(message_type)) {
         case MessageType::INSERT_ORDER: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received insert order: " << from->get_name(); 
             const PayloadInsertOrder* message = reinterpret_cast<const PayloadInsertOrder*>(payload);
             order_book_.submit_order(
                 message->price,
@@ -289,11 +293,24 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             );
             break;
         } case MessageType::CANCEL_ORDER: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received cancel order: " << from->get_name();
             const PayloadCancelOrder* message = reinterpret_cast<const PayloadCancelOrder*>(payload);
             order_book_.cancel_order(
                 from->id(),
                 message->exchange_order_id
             );
+            break;
+        } case MessageType::SUBSCRIBE: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received subscribe request: " << from->get_name();
+            subscribe_market_feed(from);
+            break;
+        } case MessageType::UNSUBSCRIBE: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received unsubscribe: " << from->get_name();
+            unsubscribe_market_feed(from);
+            break;
+        } case MessageType::DISCONNECT: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received disconnect request: " << from->get_name();
+            remove_connection(from);
             break;
         }
     }

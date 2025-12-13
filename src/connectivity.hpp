@@ -8,16 +8,13 @@
 #include <boost/interprocess/file_mapping.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/system/error_code.hpp>
+#include <boost/asio/strand.hpp>
 
 namespace interprocess = boost::interprocess;
 using boost::asio::ip::tcp;
 
 constexpr size_t MESSAGE_HEADER_SIZE = 3;
 constexpr size_t MESSAGE_TYPE_OFFSET = 2;
-constexpr size_t FRAME_PAYLOAD_SIZE_OFFSET = 4;
-constexpr size_t FRAME_HEADER_SIZE = 8;
-constexpr size_t FRAME_SIZE = 128;
-constexpr size_t SUBSCRIPTION_TRANSPORT_BUFFER_SIZE = 8182;
 
 
 class Connection : public IConnection {
@@ -43,5 +40,5 @@ class Connection : public IConnection {
         bool is_send_posted_ = false;
         tcp::socket socket_;
         Id_t id_;
-
+        boost::asio::strand<boost::asio::any_io_executor> strand_;
 };

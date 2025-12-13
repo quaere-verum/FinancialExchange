@@ -16,6 +16,7 @@
 #include <boost/interprocess/file_mapping.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/system/error_code.hpp>
+#include <boost/asio/bind_executor.hpp>
 
 #include "connectivity.hpp"
 #include "error.hpp"
@@ -38,7 +39,8 @@ Connection::Connection(boost::asio::io_context& context, tcp::socket&& socket, I
       in_buffer_(),
       out_buffer_(),
       socket_(std::move(socket)),
-      id_(id) {
+      id_(id),
+      strand_(socket_.get_executor()) {
         set_name('\'' + std::to_string(socket_.local_endpoint().port()) + '\'');
     }
 
@@ -51,7 +53,15 @@ Connection::~Connection() {
 
 void Connection::async_read() {
     auto buf = in_buffer_.prepare(READ_SIZE);
-    socket_.async_read_some(buf, [this](auto& error, auto size) { read_some_handler(error, size); });
+    socket_.async_read_some(
+        buf,
+        boost::asio::bind_executor(
+            strand_,
+            [this](const boost::system::error_code& error, size_t size) {
+                read_some_handler(error, size);
+            }
+        )
+    );
 }
 
 void Connection::close() {
@@ -120,36 +130,68 @@ void Connection::read_some_handler(const boost::system::error_code& error, size_
 
 void Connection::send() {
     is_sending_ = true;
-    socket_.async_write_some(out_buffer_.data(), [this](auto& err, auto sz) { write_some_handler(err, sz); });
+    socket_.async_write_some(
+        out_buffer_.data(),
+        boost::asio::bind_executor(
+            strand_,
+            [this](const boost::system::error_code& err, size_t sz) {
+                write_some_handler(err, sz);
+            }
+        )
+    );
 }
 
 void Connection::send(SendMode mode) {
     if (mode == SendMode::ASAP) {
         send();
     } else if (!is_send_posted_) {
-        boost::asio::post(context_, [this] {
-            is_send_posted_ = false;
-            if (!is_sending_) {
-                send();
+        boost::asio::post(
+            strand_,
+            [this] {
+                is_send_posted_ = false;
+                if (!is_sending_) {
+                    send();
+                }
             }
-        });
+        );
         is_send_posted_ = true;
     }
 }
 
 void Connection::send_message(Message_t message_type, const void* payload, SendMode mode) {
     const size_t payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
-    auto buf = out_buffer_.prepare(payload_size + MESSAGE_HEADER_SIZE);
-    auto* data = static_cast<uint8_t*>(buf.data());
-    data[0] = static_cast<uint8_t>(message_type);
-    data[1] = static_cast<uint8_t>((payload_size >> 8) & 0xFF); // big-endian hi byte
-    data[2] = static_cast<uint8_t>( payload_size & 0xFF); // big-endian lo byte
-    std::memcpy(data + MESSAGE_HEADER_SIZE, payload, payload_size);
-    out_buffer_.commit(payload_size + MESSAGE_HEADER_SIZE);
-    if (!is_sending_) {
-        send(mode);
-    }
+    std::vector<uint8_t> copy(
+        static_cast<const uint8_t*>(payload),
+        static_cast<const uint8_t*>(payload) + payload_size
+    );
+
+    boost::asio::post(
+        strand_,
+        [this, message_type, mode, copy = std::move(copy)]() mutable {
+            auto buf = out_buffer_.prepare(copy.size() + MESSAGE_HEADER_SIZE);
+            auto* data = static_cast<uint8_t*>(buf.data());
+            data[0] = static_cast<uint8_t>(message_type);
+            data[1] = (copy.size() >> 8) & 0xFF;
+            data[2] = copy.size() & 0xFF;
+            std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), copy.size());
+            out_buffer_.commit(copy.size() + MESSAGE_HEADER_SIZE);
+
+            if (!is_sending_) {
+                send(mode);
+            }
+        }
+    );
 }
+    // auto buf = out_buffer_.prepare(payload_size + MESSAGE_HEADER_SIZE);
+    // auto* data = static_cast<uint8_t*>(buf.data());
+    // data[0] = static_cast<uint8_t>(message_type);
+    // data[1] = static_cast<uint8_t>((payload_size >> 8) & 0xFF); // big-endian hi byte
+    // data[2] = static_cast<uint8_t>( payload_size & 0xFF); // big-endian lo byte
+    // std::memcpy(data + MESSAGE_HEADER_SIZE, payload, payload_size);
+    // out_buffer_.commit(payload_size + MESSAGE_HEADER_SIZE);
+    // if (!is_sending_) {
+    //     send(mode);
+    // }
 
 void Connection::write_some_handler(const boost::system::error_code& error, size_t size) {
     if (error) {
@@ -164,7 +206,15 @@ void Connection::write_some_handler(const boost::system::error_code& error, size
     }
 
     if (out_buffer_.size() > 0) {
-        socket_.async_write_some(out_buffer_.data(), [this](auto& err, auto sz) {write_some_handler(err, sz); });
+        socket_.async_write_some(
+            out_buffer_.data(),
+            boost::asio::bind_executor(
+                strand_,
+                [this](const boost::system::error_code& err, size_t sz) {
+                    write_some_handler(err, sz);
+                }
+            )
+        );
     } else {
         is_sending_ = false;
     }
