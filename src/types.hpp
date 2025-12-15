@@ -21,6 +21,12 @@ static constexpr size_t MAX_TRADES_PER_TICK = 100;
 
 enum class Lifespan : uint8_t {FILL_AND_KILL, GOOD_FOR_DAY};
 enum class Side : uint8_t {SELL, BUY};
+enum class ErrorType : uint16_t {
+    ORDER_BOOK_FULL = 1,
+    INVALID_VOLUME = 2,
+    ORDER_NOT_FOUND = 3,
+    UNAUTHORISED = 4
+};
 
 template<typename C, typename T>
 std::basic_ostream<C, T>& operator<<(std::basic_ostream<C, T>& strm, Lifespan span) {

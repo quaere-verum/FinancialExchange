@@ -395,7 +395,7 @@ inline PayloadOrderStatusRequest make_order_status_request(
 inline PayloadError make_error(
     Id_t client_request_id,
     uint16_t code,
-    std::string message,
+    std::string_view message,
     Time_t timestamp
 ) {
     PayloadError p{};

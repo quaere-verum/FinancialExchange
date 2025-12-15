@@ -19,4 +19,5 @@ struct OrderBookCallbacks {
     virtual void on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) = 0;
     virtual void on_order_amended(Id_t client_request_id, Volume_t quantity_old, const Order& order, Time_t timestamp) = 0;
     virtual void on_level_update(Side side, PriceLevel const& level, Time_t timestamp) = 0;
+    virtual void on_error(Id_t client_id, Id_t client_request_id, uint16_t code, std::string_view message, Time_t timestamp) = 0;
 };

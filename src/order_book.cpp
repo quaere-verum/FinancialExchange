@@ -19,18 +19,34 @@ size_t OrderBookSide::price_to_index(Price_t price) const noexcept {
     return static_cast<size_t>((price - MINIMUM_BID) / TICK_SIZE);
 }
 
-Order* OrderBookSide::add_order(Price_t price, Volume_t quantity, Volume_t quantity_remaining, Id_t id, Id_t client_id) noexcept {
+Order* OrderBookSide::add_order(
+    Price_t price, 
+    Volume_t quantity, 
+    Volume_t quantity_remaining, 
+    Id_t order_id, 
+    Id_t client_id,
+    Id_t client_request_id
+) noexcept {
     size_t idx = price_to_index(price);
     assert(idx < NUM_BOOK_LEVELS);
 
     Order* order = pool_.allocate();
-    if (!order) return nullptr;
+    if (!order) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id, 
+            static_cast<uint16_t>(ErrorType::ORDER_BOOK_FULL),
+            "Order book is full.",
+            utc_now_ns()
+        );
+        return nullptr;
+    }
 
     PriceLevel& level = levels_[idx];
     Order*& first = level.first_;
     Order*& last = level.last_;
     order->client_id_ = client_id;
-    order->order_id_ = id;
+    order->order_id_ = order_id;
     order->price_ = price;
     order->quantity_ = quantity;
     order->quantity_remaining_ = quantity_remaining;
@@ -220,8 +236,18 @@ void OrderBook::set_callbacks(OrderBookCallbacks* callbacks) {
     bids.set_callbacks(callbacks);
 }
 
-void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t client_id) {
-    if (quantity == 0) return;
+void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t client_id, Id_t client_request_id) {
+    Time_t now = utc_now_ns();
+    if (quantity == 0) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::INVALID_VOLUME),
+            "Invalid order size.",
+            now
+        );
+        return;
+    }
     Id_t order_id = order_id_++;
     Volume_t remaining = quantity;
     filled_order_ids_.clear();
@@ -229,16 +255,16 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
     if (is_bid) {
         remaining = asks.match_buy(price, quantity, order_id, client_id, filled_order_ids_);
         if (remaining > 0) {
-            Order* resting_order = bids.add_order(price, quantity, remaining, order_id, client_id);
+            Order* resting_order = bids.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
             order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(0, *resting_order, utc_now_ns());
+            callbacks_->on_order_inserted(0, *resting_order, now);
         }
     } else {
         remaining = bids.match_sell(price, quantity, order_id, client_id, filled_order_ids_);
         if (remaining > 0) {
-            Order* resting_order = asks.add_order(price, quantity, remaining, order_id, client_id);
+            Order* resting_order = asks.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
             order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(0, *resting_order, utc_now_ns());
+            callbacks_->on_order_inserted(client_request_id, *resting_order, now);
         }
     }
     for (Id_t order_idx : filled_order_ids_) {
@@ -251,29 +277,75 @@ void OrderBook::print_book() const {
     asks.print_side("ASKS");
 }
 
-void OrderBook::cancel_order(Id_t client_id, Id_t order_id) noexcept {
+void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_id) noexcept {
     Time_t now = utc_now_ns();
     auto order_idx = order_index_.find(order_id);
-    if (order_idx == order_index_.end()) return;
+    if (order_idx == order_index_.end()) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::ORDER_NOT_FOUND),
+            "Order ID not found.",
+            now
+        );
+        return;
+    } 
 
     Order* order = order_idx->second;
-    if (order->client_id_ != client_id) return;
+    if (order->client_id_ != client_id) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::UNAUTHORISED),
+            "Unauthorised request.",
+            now
+        );
+        return;
+    }
 
     OrderBookSide& side = order->is_bid_ ? bids : asks;
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
 
-    callbacks_->on_order_cancelled(0, *order, now);
+    callbacks_->on_order_cancelled(client_request_id, *order, now);
     remove_order(order_idx->first, order, side, level);
 }
 
-void OrderBook::amend_order(Id_t client_id, Id_t order_id, Volume_t quantity_new) noexcept {
+void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept {
     Time_t now = utc_now_ns();
     auto order_idx = order_index_.find(order_id);
-    if (order_idx == order_index_.end()) return;
+    if (order_idx == order_index_.end()) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::ORDER_NOT_FOUND),
+            "Order ID not found.",
+            now
+        );
+        return;
+    } 
 
     Order* order = order_idx->second;
-    if (order->client_id_ != client_id || quantity_new < order->quantity_cumulative_) return; // Invalid request
+    if (order->client_id_ != client_id) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::UNAUTHORISED),
+            "Unauthorised request.",
+            now
+        );
+        return;
+    }
+    if (quantity_new < order->quantity_cumulative_) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::INVALID_VOLUME),
+            "Invalid order size.",
+            now
+        );
+        return;
+    }
 
     OrderBookSide& side = order->is_bid_ ? bids : asks;
     size_t idx = side.price_to_index(order->price_);
@@ -291,7 +363,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t order_id, Volume_t quantity_new
     order->quantity_remaining_ = quantity_new_remaining;
     level.total_quantity_ += delta;
 
-    callbacks_->on_order_amended(0, quantity_old_total, *order, now);
+    callbacks_->on_order_amended(client_request_id, quantity_old_total, *order, now);
 
     if (quantity_new_remaining == 0) {
         remove_order(order_idx->first, order, side, level);

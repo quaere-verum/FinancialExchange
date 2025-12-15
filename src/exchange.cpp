@@ -303,6 +303,18 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
     }
 }
 
+void Exchange::on_error(Id_t client_id, Id_t client_request_id, uint16_t code, std::string_view message, Time_t timestamp) {
+    PayloadError error_message = make_error(client_request_id, code, message, timestamp);
+    auto client = clients_.find(client_id);
+    if (client != clients_.end() && client->second) {
+        send_to(
+            client->second.get(), 
+            static_cast<Message_t>(MessageType::ERROR_MSG), 
+            &error_message
+        );
+    }
+}
+
 void Exchange::on_message(Connection* from, Message_t message_type, const uint8_t* payload) {
     switch (static_cast<MessageType>(message_type)) {
         case MessageType::INSERT_ORDER: {
@@ -312,7 +324,8 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
                 message->price,
                 message->quantity,
                 message->side == Side::BUY, // TODO: add lifespan
-                from->id()
+                from->id(),
+                message->client_request_id
             );
             break;
         } case MessageType::CANCEL_ORDER: {
@@ -320,13 +333,14 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             const PayloadCancelOrder* message = reinterpret_cast<const PayloadCancelOrder*>(payload);
             order_book_.cancel_order(
                 from->id(),
+                message->client_request_id,
                 message->exchange_order_id
             );
             break;
         } case MessageType::AMEND_ORDER: {
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received amend request: " << from->get_name();
             const PayloadAmendOrder* message = reinterpret_cast<const PayloadAmendOrder*>(payload);
-            order_book_.amend_order(from->id(), message->exchange_order_id, message->new_total_quantity);
+            order_book_.amend_order(from->id(), message->client_request_id, message->exchange_order_id, message->new_total_quantity);
             break;
         } case MessageType::SUBSCRIBE: {
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received subscribe request: " << from->get_name();
