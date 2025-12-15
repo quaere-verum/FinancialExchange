@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include "order_book.hpp"
 #include "time.hpp"
 
@@ -319,4 +320,51 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
     callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, utc_now_ns());
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);
+}
+
+void OrderBook::build_snapshot(
+    std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_volumes,
+    std::array<Price_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_prices,
+    std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH>& ask_volumes,
+    std::array<Price_t, ORDER_BOOK_MESSAGE_DEPTH>& ask_prices
+) {
+    bid_volumes.fill(0);
+    bid_prices.fill(0);
+    ask_volumes.fill(0);
+    ask_prices.fill(0);
+
+    {
+        size_t depth = 0;
+        size_t idx = bids.best_price_index_;
+
+        while (idx < NUM_BOOK_LEVELS && depth < ORDER_BOOK_MESSAGE_DEPTH) {
+            const PriceLevel& level = bids.levels_[idx];
+
+            if (level.total_quantity_ > 0) {
+                bid_prices[depth]  = level.price_;
+                bid_volumes[depth] = level.total_quantity_;
+                ++depth;
+            }
+
+            if (idx == 0) break;
+            --idx;
+        }
+    }
+
+    {
+        size_t depth = 0;
+        size_t idx = asks.best_price_index_;
+
+        while (idx < NUM_BOOK_LEVELS && depth < ORDER_BOOK_MESSAGE_DEPTH) {
+            const PriceLevel& level = asks.levels_[idx];
+
+            if (level.total_quantity_ > 0) {
+                ask_prices[depth]  = level.price_;
+                ask_volumes[depth] = level.total_quantity_;
+                ++depth;
+            }
+
+            ++idx;
+        }
+    }
 }

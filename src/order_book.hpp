@@ -30,6 +30,8 @@ struct OrderBookSide {
     void update_best_ask_after_empty() noexcept;
     void set_callbacks(OrderBookCallbacks* callbacks) {callbacks_ = callbacks;}
 
+
+
     private:
         template <typename PriceCrossFn, typename BestPriceFn>
         Volume_t match_loop(
@@ -57,6 +59,12 @@ struct OrderBook {
     void amend_order(Id_t client_id, Id_t order_id, Volume_t quantity_new) noexcept;
     void set_callbacks(OrderBookCallbacks* callbacks);
     void remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level);
+    void build_snapshot(
+        std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_volumes,
+        std::array<Price_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_prices,
+        std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH>& ask_volumes,
+        std::array<Price_t, ORDER_BOOK_MESSAGE_DEPTH>& ask_prices
+    );
 
     private:
         Id_t order_id_;

@@ -58,7 +58,30 @@ Connection* Exchange::connect(tcp::socket socket) {
     return ptr;
 }
 
-void Exchange::subscribe_market_feed(Connection* client) {market_data_subscribers_.push_back(client);}
+void Exchange::subscribe_market_feed(Connection* client) {
+    Id_t sequence_number = sequence_number_++;
+    market_data_subscribers_.push_back(client);
+
+    std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH> bid_volumes;
+    std::array<Price_t,  ORDER_BOOK_MESSAGE_DEPTH> bid_prices;
+    std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH> ask_volumes;
+    std::array<Price_t,  ORDER_BOOK_MESSAGE_DEPTH> ask_prices;
+
+    order_book_.build_snapshot(bid_volumes, bid_prices, ask_volumes, ask_prices);
+
+    PayloadOrderBookSnapshot snapshot = make_order_book_snapshot(
+        ask_prices,
+        ask_volumes,
+        bid_prices,
+        bid_volumes,
+        sequence_number
+    );
+    send_to(
+        client,
+        static_cast<Message_t>(MessageType::ORDER_BOOK_SNAPSHOT),
+        &snapshot
+    );
+}
 
 void Exchange::unsubscribe_market_feed(Connection* client) {
     auto it = std::find(market_data_subscribers_.begin(), market_data_subscribers_.end(), client);
