@@ -3,8 +3,8 @@ project(FinancialExchange LANGUAGES CXX)
 add_compile_definitions(_WIN32_WINNT=0x0603 WINVER=0x0603)
 
 # Prevent CMake from searching Anaconda for packages
-set(CMAKE_IGNORE_PREFIX_PATH "C:/Users/bramb/anaconda3")
-set(CMAKE_IGNORE_PREFIX_PATH "C:/Users/bramb/anaconda3/Library")
+set(CMAKE_IGNORE_PREFIX_PATH "${CONDA_PATH}")
+set(CMAKE_IGNORE_PREFIX_PATH "${CONDA_PATH}/Library")
 
 if(MSVC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++17")
@@ -20,8 +20,8 @@ endif()
 set(Boost_USE_STATIC_LIBS OFF)   # use dynamic libraries
 set(Boost_USE_MULTITHREADED ON)
 set(Boost_USE_STATIC_RUNTIME OFF)
-SET(CMAKE_INCLUDE_PATH ${CMAKE_INCLUDE_PATH} "C:/Users/bramb/vcpkg/installed/x64-windows/include")
-SET(CMAKE_LIBRARY_PATH ${CMAKE_LIBRARY_PATH} "C:/Users/bramb/vcpkg/installed/x64-windows/lib")
+set(CMAKE_INCLUDE_PATH ${CMAKE_INCLUDE_PATH} "${VCPKG_PATH}/installed/x64-windows/include")
+set(CMAKE_LIBRARY_PATH ${CMAKE_LIBRARY_PATH} "${VCPKG_PATH}/installed/x64-windows/lib")
 
 find_package(Boost REQUIRED COMPONENTS
     system
