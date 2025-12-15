@@ -5,6 +5,7 @@
 OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
     for (size_t i = 0; i < NUM_BOOK_LEVELS; ++i) {
+        levels_[i].idx_ = i;
         levels_[i].price_ = MINIMUM_BID + i * TICK_SIZE;
         levels_[i].total_quantity_ = 0;
         levels_[i].first_ = nullptr;
@@ -65,7 +66,8 @@ void OrderBookSide::update_best_ask_after_order(size_t price_idx) {
     }
 }
 
-void OrderBookSide::update_best_bid_after_empty(size_t old_idx) noexcept {
+void OrderBookSide::update_best_bid_after_empty() noexcept {
+    size_t old_idx = best_price_index_;
     for (size_t i = old_idx; i-- > 0; ) {
         if (levels_[i].total_quantity_ > 0) {
             best_price_index_ = i;
@@ -75,7 +77,8 @@ void OrderBookSide::update_best_bid_after_empty(size_t old_idx) noexcept {
     best_price_index_ = NUM_BOOK_LEVELS;
 }
 
-void OrderBookSide::update_best_ask_after_empty(size_t old_idx) noexcept {
+void OrderBookSide::update_best_ask_after_empty() noexcept {
+    size_t old_idx = best_price_index_;
     for (size_t i = old_idx + 1; i < NUM_BOOK_LEVELS; ++i) {
         if (levels_[i].total_quantity_ > 0) {
             best_price_index_ = i;
@@ -85,45 +88,59 @@ void OrderBookSide::update_best_ask_after_empty(size_t old_idx) noexcept {
     best_price_index_ = NUM_BOOK_LEVELS;
 }
 
-Volume_t OrderBookSide::match_buy(
-    Price_t incoming_price, 
+template <typename PriceCrossFn, typename BestPriceFn>
+Volume_t OrderBookSide::match_loop(
+    Price_t incoming_price,
     Volume_t incoming_quantity,
     Id_t order_id,
-    Id_t client_id
+    Id_t client_id,
+    Side maker_side,
+    PriceCrossFn crosses,
+    BestPriceFn advance_best,
+    std::vector<Id_t>& filled_order_ids
 ) noexcept {
+    Time_t now = utc_now_ns();
     Volume_t total_incoming_quantity = incoming_quantity;
+
     while (incoming_quantity > 0) {
-        if (best_price_index_ == NUM_BOOK_LEVELS) break;
+        if (best_price_index_ == NUM_BOOK_LEVELS)
+            break;
 
         PriceLevel* level = &levels_[best_price_index_];
-        if (!(level->price_ <= incoming_price)) break;
+        if (!crosses(level->price_, incoming_price))
+            break;
 
         while (incoming_quantity > 0 && level->first_) {
             Order* maker = level->first_;
-            Time_t now = utc_now_ns();
+
             Volume_t trade_quantity = std::min(maker->quantity_remaining_, incoming_quantity);
+
             maker->quantity_remaining_ -= trade_quantity;
             maker->quantity_cumulative_ += trade_quantity;
             incoming_quantity -= trade_quantity;
             level->total_quantity_ -= trade_quantity;
 
             callbacks_->on_trade(
-                *maker, 
-                client_id, 
-                order_id, 
-                incoming_price, 
+                *maker,
+                client_id,
+                order_id,
+                maker->price_,
                 total_incoming_quantity,
                 total_incoming_quantity - incoming_quantity,
                 trade_quantity,
                 now
             );
-            callbacks_->on_level_update(Side::BUY, *level, now);
+            callbacks_->on_level_update(maker_side, *level, now);
 
             if (maker->quantity_remaining_ == 0) {
-                level->first_ = maker->next_;
-                if (!level->first_) {
+                filled_order_ids.push_back(maker->order_id_);
+                Order* next = maker->next_;
+                level->first_ = next;
+                if (next) {
+                    next->previous_ = nullptr;
+                } else {
                     level->last_ = nullptr;
-                    update_best_ask_after_empty(best_price_index_);
+                    advance_best();
                 }
                 pool_.deallocate(maker);
             }
@@ -132,51 +149,43 @@ Volume_t OrderBookSide::match_buy(
     return incoming_quantity;
 }
 
+
+Volume_t OrderBookSide::match_buy(
+    Price_t incoming_price, 
+    Volume_t incoming_quantity,
+    Id_t order_id,
+    Id_t client_id,
+    std::vector<Id_t>& filled_order_ids
+) noexcept {
+    return match_loop(
+        incoming_price,
+        incoming_quantity,
+        order_id,
+        client_id,
+        Side::SELL,
+        [](Price_t level_price, Price_t incoming) {return level_price <= incoming;},
+        [this]() {update_best_ask_after_empty();},
+        filled_order_ids
+    );
+}
+
 Volume_t OrderBookSide::match_sell(
     Price_t incoming_price, 
     Volume_t incoming_quantity,
     Id_t order_id,
-    Id_t client_id
+    Id_t client_id,
+    std::vector<Id_t>& filled_order_ids
 ) noexcept {
-    Volume_t total_incoming_quantity = incoming_quantity;
-    while (incoming_quantity > 0) {
-        if (best_price_index_ == NUM_BOOK_LEVELS) break;
-
-        PriceLevel* level = &levels_[best_price_index_];
-        if (!(level->price_ >= incoming_price)) break;
-
-        while (incoming_quantity > 0 && level->first_) {
-            Order* maker = level->first_;
-            Time_t now = utc_now_ns();
-            Volume_t trade_quantity = std::min(maker->quantity_remaining_, incoming_quantity);
-            maker->quantity_remaining_ -= trade_quantity;
-            maker->quantity_cumulative_ += trade_quantity;
-            incoming_quantity -= trade_quantity;
-            level->total_quantity_ -= trade_quantity;
-
-            callbacks_->on_trade(
-                *maker, 
-                client_id, 
-                order_id, 
-                incoming_price, 
-                total_incoming_quantity,
-                total_incoming_quantity - incoming_quantity,
-                trade_quantity,
-                now
-            );
-            callbacks_->on_level_update(Side::SELL, *level, now);
-
-            if (maker->quantity_remaining_ == 0) {
-                level->first_ = maker->next_;
-                if (!level->first_) {
-                    level->last_ = nullptr;
-                    update_best_bid_after_empty(best_price_index_);
-                }
-                pool_.deallocate(maker);
-            }
-        }
-    }
-    return incoming_quantity;
+    return match_loop(
+        incoming_price,
+        incoming_quantity,
+        order_id,
+        client_id,
+        Side::BUY,
+        [](Price_t level_price, Price_t incoming) {return level_price >= incoming;},
+        [this]() {update_best_bid_after_empty();},
+        filled_order_ids
+    );
 }
 
 void OrderBookSide::print_side(const char* name) const {
@@ -199,6 +208,7 @@ void OrderBookSide::print_side(const char* name) const {
 
 OrderBook::OrderBook() : bids(true), asks(false), order_id_(0), trade_id_(0) {
     order_index_.reserve(MAX_ORDERS);
+    filled_order_ids_.reserve(MAX_TRADES_PER_TICK); // TODO: actually enforce max trades per tick
     asks.set_callbacks(callbacks_);
     bids.set_callbacks(callbacks_);
 }
@@ -208,27 +218,30 @@ void OrderBook::set_callbacks(OrderBookCallbacks* callbacks) {
     asks.set_callbacks(callbacks);
     bids.set_callbacks(callbacks);
 }
+
 void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t client_id) {
     if (quantity == 0) return;
     Id_t order_id = order_id_++;
     Volume_t remaining = quantity;
+    filled_order_ids_.clear();
 
     if (is_bid) {
-        remaining = asks.match_buy(price, quantity, order_id, client_id);
+        remaining = asks.match_buy(price, quantity, order_id, client_id, filled_order_ids_);
         if (remaining > 0) {
-            Order* resting_order = bids.add_order(price, quantity, remaining, order_id_, client_id);
-            Time_t now = utc_now_ns();
+            Order* resting_order = bids.add_order(price, quantity, remaining, order_id, client_id);
             order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(0, *resting_order, now);
+            callbacks_->on_order_inserted(0, *resting_order, utc_now_ns());
         }
     } else {
-        remaining = bids.match_sell(price, quantity, order_id, client_id);
+        remaining = bids.match_sell(price, quantity, order_id, client_id, filled_order_ids_);
         if (remaining > 0) {
-            Order* resting_order = asks.add_order(price, quantity, remaining, order_id_, client_id);
-            Time_t now = utc_now_ns();
+            Order* resting_order = asks.add_order(price, quantity, remaining, order_id, client_id);
             order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(0, *resting_order, now);
+            callbacks_->on_order_inserted(0, *resting_order, utc_now_ns());
         }
+    }
+    for (Id_t order_idx : filled_order_ids_) {
+        order_index_.erase(order_idx);
     }
 }
 
@@ -249,26 +262,61 @@ void OrderBook::cancel_order(Id_t client_id, Id_t order_id) noexcept {
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
 
-    if (order->previous_)
-        order->previous_->next_ = order->next_;
-    else
-        level.first_ = order->next_;
-
-    if (order->next_)
-        order->next_->previous_ = order->previous_;
-    else
-        level.last_ = order->previous_;
-
-    level.total_quantity_ -= order->quantity_;
-    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
-
-    if (!level.first_) {
-        if (order->is_bid_)
-            side.update_best_bid_after_empty(idx);
-        else
-            side.update_best_ask_after_empty(idx);
-    }
     callbacks_->on_order_cancelled(0, *order, now);
+    remove_order(order_idx->first, order, side, level);
+}
+
+void OrderBook::amend_order(Id_t client_id, Id_t order_id, Volume_t quantity_new) noexcept {
+    Time_t now = utc_now_ns();
+    auto order_idx = order_index_.find(order_id);
+    if (order_idx == order_index_.end()) return;
+
+    Order* order = order_idx->second;
+    if (order->client_id_ != client_id || quantity_new < order->quantity_cumulative_) return; // Invalid request
+
+    OrderBookSide& side = order->is_bid_ ? bids : asks;
+    size_t idx = side.price_to_index(order->price_);
+    PriceLevel& level = side.levels_[idx];
+
+    Volume_t quantity_old_total = order->quantity_;
+    Volume_t quantity_old_remaining = order->quantity_remaining_;
+
+    Volume_t quantity_new_total = quantity_new;
+    Volume_t quantity_new_remaining = quantity_new_total - order->quantity_cumulative_;
+
+    Volume_t delta = quantity_new_remaining - quantity_old_remaining;
+
+    order->quantity_ = quantity_new_total;
+    order->quantity_remaining_ = quantity_new_remaining;
+    level.total_quantity_ += delta;
+
+    callbacks_->on_order_amended(0, quantity_old_total, *order, now);
+
+    if (quantity_new_remaining == 0) {
+        remove_order(order_idx->first, order, side, level);
+    }
+}
+
+void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level) {
+    if (order->previous_) {
+        order->previous_->next_ = order->next_;
+    } else {
+        level.first_ = order->next_;
+    }
+    if (order->next_) {
+        order->next_->previous_ = order->previous_;
+    } else {
+        level.last_ = order->previous_;
+    }
+
+    level.total_quantity_ -= order->quantity_remaining_;
+    if (!level.first_ && side.best_price_index_ == level.idx_) {
+        if (order->is_bid_)
+            side.update_best_bid_after_empty();
+        else
+            side.update_best_ask_after_empty();
+    }
+    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, utc_now_ns());
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);
 }

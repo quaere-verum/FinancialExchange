@@ -12,22 +12,15 @@ using Seq_t = uint64_t;
 using Message_t = uint8_t;
 
 static constexpr size_t MAX_ORDERS = 1'000;
-static constexpr Price_t MINIMUM_BID = 800;
-static constexpr Price_t MAXIMUM_ASK = 1200;
+static constexpr Price_t MINIMUM_BID = 1;
+static constexpr Price_t MAXIMUM_ASK = 10'000;
 static constexpr Price_t TICK_SIZE = 1;
 static constexpr size_t NUM_BOOK_LEVELS = (MAXIMUM_ASK - MINIMUM_BID) / TICK_SIZE + 1;
 static constexpr size_t ORDER_BOOK_MESSAGE_DEPTH = 5;
 static constexpr size_t MAX_TRADES_PER_TICK = 100;
 
-enum class Instrument : unsigned char {ETF, FUTURES};
-enum class Lifespan : unsigned char {FILL_AND_KILL, GOOD_FOR_DAY};
-enum class Side : unsigned char {SELL, BUY};
-
-template<typename C, typename T>
-std::basic_ostream<C, T>& operator<<(std::basic_ostream<C, T>& strm, Instrument inst) {
-    strm << ((inst == Instrument::ETF) ? "ETF" : "Futures");
-    return strm;
-}
+enum class Lifespan : uint8_t {FILL_AND_KILL, GOOD_FOR_DAY};
+enum class Side : uint8_t {SELL, BUY};
 
 template<typename C, typename T>
 std::basic_ostream<C, T>& operator<<(std::basic_ostream<C, T>& strm, Lifespan span) {
@@ -61,5 +54,4 @@ struct IConnection {
         }
 
         std::string name_;
-
 };

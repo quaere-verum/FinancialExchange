@@ -300,6 +300,11 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
                 message->exchange_order_id
             );
             break;
+        } case MessageType::AMEND_ORDER: {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received amend request: " << from->get_name();
+            const PayloadAmendOrder* message = reinterpret_cast<const PayloadAmendOrder*>(payload);
+            order_book_.amend_order(from->id(), message->exchange_order_id, message->new_total_quantity);
+            break;
         } case MessageType::SUBSCRIBE: {
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received subscribe request: " << from->get_name();
             subscribe_market_feed(from);
