@@ -15,7 +15,6 @@ OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
 }
 
 size_t OrderBookSide::price_to_index(Price_t price) const noexcept {
-    assert(price >= MINIMUM_BID && price <= MAXIMUM_ASK);
     return static_cast<size_t>((price - MINIMUM_BID));
 }
 
@@ -28,8 +27,6 @@ Order* OrderBookSide::add_order(
     Id_t client_request_id
 ) noexcept {
     size_t idx = price_to_index(price);
-    assert(idx < NUM_BOOK_LEVELS);
-
     Order* order = pool_.allocate();
     if (!order) {
         callbacks_->on_error(
@@ -244,6 +241,16 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
             client_request_id,
             static_cast<uint16_t>(ErrorType::INVALID_VOLUME),
             "Invalid order size.",
+            now
+        );
+        return;
+    }
+    if (price < MINIMUM_BID || price > MAXIMUM_ASK) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::INVALID_PRICE),
+            "Invalid price.",
             now
         );
         return;

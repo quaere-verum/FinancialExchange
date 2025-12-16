@@ -24,7 +24,8 @@ enum class ErrorType : uint16_t {
     ORDER_BOOK_FULL = 1,
     INVALID_VOLUME = 2,
     ORDER_NOT_FOUND = 3,
-    UNAUTHORISED = 4
+    UNAUTHORISED = 4,
+    INVALID_PRICE = 5
 };
 
 template<typename C, typename T>
