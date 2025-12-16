@@ -13,8 +13,6 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/endian/conversion.hpp>
-#include <boost/interprocess/file_mapping.hpp>
-#include <boost/interprocess/mapped_region.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/bind_executor.hpp>
 
@@ -24,7 +22,6 @@
 #include "protocol.hpp"
 
 namespace error = boost::asio::error;
-namespace interprocess = boost::interprocess;
 namespace ip = boost::asio::ip;
 using boost::asio::ip::tcp;
 

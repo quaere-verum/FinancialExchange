@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/asio/strand.hpp>
 #include <unordered_map>
 #include <memory>
 #include <functional>
@@ -23,7 +24,6 @@ class Exchange : public OrderBookCallbacks {
         void send_to(Connection* client, Message_t message_type, const void* payload);
         void subscribe_market_feed(Connection* client);
         void unsubscribe_market_feed(Connection* client);
-        Connection* connect(tcp::socket socket);
 
         void on_trade(
             const Order& maker_order,
@@ -45,8 +45,10 @@ class Exchange : public OrderBookCallbacks {
         void do_accept();
         void remove_connection(Connection* conn);
         void on_message(Connection* from, Message_t message_type, const uint8_t* payload);
+        Connection* connect(tcp::socket socket);
 
         boost::asio::io_context& context_;
+        boost::asio::strand<boost::asio::any_io_executor> strand_;
         tcp::acceptor acceptor_;
         std::unordered_map<Id_t, std::unique_ptr<Connection>> clients_;
         std::vector<Connection*> market_data_subscribers_;

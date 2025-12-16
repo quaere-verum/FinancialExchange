@@ -7,7 +7,7 @@ OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
     for (size_t i = 0; i < NUM_BOOK_LEVELS; ++i) {
         levels_[i].idx_ = i;
-        levels_[i].price_ = MINIMUM_BID + i * TICK_SIZE;
+        levels_[i].price_ = MINIMUM_BID + i;
         levels_[i].total_quantity_ = 0;
         levels_[i].first_ = nullptr;
         levels_[i].last_ = nullptr;
@@ -16,7 +16,7 @@ OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
 
 size_t OrderBookSide::price_to_index(Price_t price) const noexcept {
     assert(price >= MINIMUM_BID && price <= MAXIMUM_ASK);
-    return static_cast<size_t>((price - MINIMUM_BID) / TICK_SIZE);
+    return static_cast<size_t>((price - MINIMUM_BID));
 }
 
 Order* OrderBookSide::add_order(

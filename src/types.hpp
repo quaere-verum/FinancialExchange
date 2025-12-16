@@ -14,9 +14,8 @@ using Message_t = uint8_t;
 static constexpr size_t MAX_ORDERS = 1'000;
 static constexpr Price_t MINIMUM_BID = 1;
 static constexpr Price_t MAXIMUM_ASK = 10'000;
-static constexpr Price_t TICK_SIZE = 1;
-static constexpr size_t NUM_BOOK_LEVELS = (MAXIMUM_ASK - MINIMUM_BID) / TICK_SIZE + 1;
-static constexpr size_t ORDER_BOOK_MESSAGE_DEPTH = 5;
+static constexpr size_t NUM_BOOK_LEVELS = MAXIMUM_ASK - MINIMUM_BID + 1;
+static constexpr size_t ORDER_BOOK_MESSAGE_DEPTH = 10;
 static constexpr size_t MAX_TRADES_PER_TICK = 100;
 
 enum class Lifespan : uint8_t {FILL_AND_KILL, GOOD_FOR_DAY};

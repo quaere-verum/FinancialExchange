@@ -5,16 +5,12 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/streambuf.hpp>
-#include <boost/interprocess/file_mapping.hpp>
-#include <boost/interprocess/mapped_region.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/strand.hpp>
 
-namespace interprocess = boost::interprocess;
 using boost::asio::ip::tcp;
 
 constexpr size_t MESSAGE_HEADER_SIZE = 3;
-constexpr size_t MESSAGE_TYPE_OFFSET = 2;
 
 
 class Connection : public IConnection {

@@ -6,7 +6,8 @@
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
 Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
-    : context_(context), 
+    : context_(context),
+    strand_(context_.get_executor()),
     acceptor_(context, tcp::endpoint(tcp::v4(), port)), 
     next_connection_id_(0),
     trade_id_(0),
@@ -14,22 +15,51 @@ Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
         order_book_.set_callbacks(this);
     }
 
-void Exchange::start() {do_accept();}
+void Exchange::start() {
+    acceptor_.async_accept(
+        boost::asio::bind_executor(
+            strand_,
+            [this](boost::system::error_code ec, tcp::socket socket) {
+                if (!ec) {
+                    connect(std::move(socket));
+                } else if (ec == boost::asio::error::operation_aborted) {
+                    return;
+                }
+                if (acceptor_.is_open()) {do_accept();}
+            }
+        )
+    );
+}
 
 void Exchange::stop() {
-    boost::system::error_code ec;
-    acceptor_.close(ec);
-    for (auto& [id, client] : clients_) {
-        if (client) {client->close();}
-    }
-    clients_.clear();
+    boost::asio::dispatch(
+        strand_,
+        [this]() {
+            boost::system::error_code ec;
+            acceptor_.close(ec);
+
+            for (auto& [id, client] : clients_) {
+                if (client) {
+                    client->close();
+                }
+            }
+            clients_.clear();
+        }
+    );
 }
 
 
 void Exchange::broadcast(Message_t message_type, const uint8_t* payload) {
-    for (auto& [id, client] : clients_) {
-        if (client) {client->send_message(message_type, payload, SendMode::ASAP);}
-    }
+    boost::asio::post(
+        strand_,
+        [this, message_type, payload]() {
+            for (auto& [id, client] : clients_) {
+                if (client) {
+                    client->send_message(message_type, payload, SendMode::ASAP);
+                }
+            }
+        }
+    );
 }
 
 void Exchange::send_to(Connection* client, Message_t message_type, const void* payload) {
