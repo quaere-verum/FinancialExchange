@@ -44,7 +44,7 @@ The exchange communicates using a binary message protocol:
 
 - Fixed-size headers
 - Explicit message type and payload size
-- Big-endian encoding
+- Little-endian encoding
 
 Supported message types include:
 - Order insert

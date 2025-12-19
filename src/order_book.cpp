@@ -26,6 +26,7 @@ Order* OrderBookSide::add_order(
     Id_t client_id,
     Id_t client_request_id
 ) noexcept {
+    Time_t now = utc_now_ns();
     size_t idx = price_to_index(price);
     Order* order = pool_.allocate();
     if (!order) {
@@ -34,7 +35,7 @@ Order* OrderBookSide::add_order(
             client_request_id, 
             static_cast<uint16_t>(ErrorType::ORDER_BOOK_FULL),
             "Order book is full.",
-            utc_now_ns()
+            now
         );
         return nullptr;
     }
@@ -59,7 +60,7 @@ Order* OrderBookSide::add_order(
     }
     last = order;
     level.total_quantity_ += quantity;
-
+    callbacks_->on_level_update(is_bid_ ? Side::BUY : Side::SELL, level, now);
     if (is_bid_)
         update_best_bid_after_order(idx);
     else
@@ -315,6 +316,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     PriceLevel& level = side.levels_[idx];
 
     callbacks_->on_order_cancelled(client_request_id, *order, now);
+    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
     remove_order(order_idx->first, order, side, level);
 }
 
@@ -371,7 +373,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     level.total_quantity_ += delta;
 
     callbacks_->on_order_amended(client_request_id, quantity_old_total, *order, now);
-
+    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
     if (quantity_new_remaining == 0) {
         remove_order(order_idx->first, order, side, level);
     }
@@ -396,7 +398,6 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
         else
             side.update_best_ask_after_empty();
     }
-    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, utc_now_ns());
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);
 }

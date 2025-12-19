@@ -95,7 +95,8 @@ void Connection::read_some_handler(const boost::system::error_code& error, size_
     
     while (available >= MESSAGE_HEADER_SIZE) {
         uint8_t message_type = upto[0];
-        uint16_t payload_size = (static_cast<uint16_t>(upto[1]) << 8) | static_cast<uint16_t>(upto[2]); // read big-endian uint16_t length stored at offset 1..2
+        uint16_t payload_size;
+        std::memcpy(&payload_size, &upto[1], sizeof(payload_size));
         size_t expected_payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
 
         if ((static_cast<size_t>(payload_size) != expected_payload_size) && (expected_payload_size > 0)) {
@@ -165,12 +166,13 @@ void Connection::send_message(Message_t message_type, const void* payload, SendM
     boost::asio::post(
         strand_,
         [this, message_type, mode, copy = std::move(copy)]() mutable {
+            const uint16_t payload_size = static_cast<uint16_t>(copy.size());
+
             auto buf = out_buffer_.prepare(copy.size() + MESSAGE_HEADER_SIZE);
             auto* data = static_cast<uint8_t*>(buf.data());
             data[0] = static_cast<uint8_t>(message_type);
-            data[1] = (copy.size() >> 8) & 0xFF;
-            data[2] = copy.size() & 0xFF;
-            std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), copy.size());
+            std::memcpy(data + 1, &payload_size, sizeof(payload_size));
+            std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), payload_size);
             out_buffer_.commit(copy.size() + MESSAGE_HEADER_SIZE);
 
             if (!is_sending_) {
@@ -179,16 +181,6 @@ void Connection::send_message(Message_t message_type, const void* payload, SendM
         }
     );
 }
-    // auto buf = out_buffer_.prepare(payload_size + MESSAGE_HEADER_SIZE);
-    // auto* data = static_cast<uint8_t*>(buf.data());
-    // data[0] = static_cast<uint8_t>(message_type);
-    // data[1] = static_cast<uint8_t>((payload_size >> 8) & 0xFF); // big-endian hi byte
-    // data[2] = static_cast<uint8_t>( payload_size & 0xFF); // big-endian lo byte
-    // std::memcpy(data + MESSAGE_HEADER_SIZE, payload, payload_size);
-    // out_buffer_.commit(payload_size + MESSAGE_HEADER_SIZE);
-    // if (!is_sending_) {
-    //     send(mode);
-    // }
 
 void Connection::write_some_handler(const boost::system::error_code& error, size_t size) {
     if (error) {

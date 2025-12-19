@@ -266,7 +266,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
         if (c) {
             send_to(
                 c,
-                static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT),
+                static_cast<Message_t>(MessageType::ORDER_CANCELLED_EVENT),
                 &cancel_message
             );
         }
@@ -306,7 +306,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
         if (c) {
             send_to(
                 c,
-                static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT),
+                static_cast<Message_t>(MessageType::ORDER_AMENDED_EVENT),
                 &amended_message
             );
         }
@@ -326,7 +326,7 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
         if (c) {
             send_to(
                 c,
-                static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT),
+                static_cast<Message_t>(MessageType::PRICE_LEVEL_UPDATE),
                 &message
             );
         }

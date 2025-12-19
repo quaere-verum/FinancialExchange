@@ -148,7 +148,7 @@ struct PayloadTradeTicks {
 };
 
 struct PayloadTradeEvent {
-     Id_t sequence_number;
+    Id_t sequence_number;
     Id_t trade_id;
     Price_t price;
     Volume_t quantity;
