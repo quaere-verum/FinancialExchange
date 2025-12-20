@@ -64,7 +64,9 @@ class Trader(abc.ABC):
             case MessageType.PARTIAL_FILL_ORDER:
                 self._on_partial_fill(fields)
             case MessageType.CONFIRM_ORDER_CANCELLED:
-                pass
+                self._on_confirm_order_cancelled(fields)
+            case MessageType.CONFIRM_ORDER_AMENDED:
+                self._on_confirm_order_amended(fields)
 
     def _on_order_book_snapshot(self, fields: dict):
         # len(fields) = 4 * ORDER_BOOK_DEPTH (bids + asks, volumes + prices) + 1 (sequence number)
@@ -113,6 +115,17 @@ class Trader(abc.ABC):
         order = self._open_orders[fields["exchange_order_id"]]
         order.quantity_remaining = leaves_quantity
         order.quantity_cumulative = fields["cumulative_quantity"]
+
+    def _on_confirm_order_cancelled(self, fields: dict):
+        try:
+            del self._open_orders[fields["exchange_order_id"]]
+        except KeyError:
+            return
+
+    def _on_confirm_order_amended(self, fields: dict):
+        id = fields["exchange_order_id"]
+        self._open_orders[id].quantity = fields["new_total_quantity"]
+        self._open_orders[id].quantity_remaining = fields["leaves_quantity"]
 
     def insert_order(self, price: int, quantity: int, side: Side):
         self._send(MessageType.INSERT_ORDER, self.next_request_id, side, price, quantity, Lifespan.GOOD_FOR_DAY)
