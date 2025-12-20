@@ -314,6 +314,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     OrderBookSide& side = order->is_bid_ ? bids : asks;
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
+    level.total_quantity_ -= order->quantity_remaining_;
 
     callbacks_->on_order_cancelled(client_request_id, *order, now);
     callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
