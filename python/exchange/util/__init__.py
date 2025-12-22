@@ -48,7 +48,7 @@ CPP_TO_STRUCT = {
     "uint32_t": "I",
     "uint64_t": "Q",
     "int64_t": "q",
-    "char": "c",
+    "char": "s", # technically wrong
 
     # typedefs from types.hpp
     "Id_t": "I",
@@ -140,9 +140,14 @@ def parse_message_types(protocol_hpp: str) -> dict[int, str]:
 # Struct parser
 # ----------------------------
 
+def decode_c_string(b: bytes, encoding="ascii") -> str:
+    return b.rstrip(b"\x00").decode(encoding, errors="ignore")
+
 STRUCT_DEF_RE = re.compile(r"struct\s+(\w+)\s*\{([^}]*)\};", re.S)
 ARRAY_RE = re.compile(r"std::array<\s*(\w+)\s*,\s*(\w+)\s*>")
-FIELD_RE = re.compile(r"(\w+)\s+(\w+)(\[(\d+)\])?;")
+FIELD_RE = re.compile(
+    r"(\w+)\s+(\w+)(?:\[(\w+)\])?;"
+)
 
 
 def parse_constants(types_hpp: str) -> dict[str, int]:
@@ -203,11 +208,19 @@ def parse_structs(protocol_hpp: str, constants: dict[str, int]) -> dict[str, Pay
             if not m:
                 continue
 
-            ctype, name, _, arr_count = m.groups()
+            ctype, name, arr_count = m.groups()
             if arr_count:
-                for i in range(int(arr_count)):
-                    fmt += CPP_TO_STRUCT[ctype]
-                    field_names.append(f"{name}[{i}]")
+                try:
+                    arr_count = int(arr_count)
+                except ValueError:
+                    arr_count = constants[arr_count]
+                if ctype == "char":
+                    fmt += f"{arr_count}{CPP_TO_STRUCT[ctype]}"
+                    field_names.append(name)
+                else:
+                    for i in range(int(arr_count)):
+                        fmt += CPP_TO_STRUCT[ctype]
+                        field_names.append(f"{name}[{i}]")
             else:
                 fmt += CPP_TO_STRUCT[ctype]
                 field_names.append(name)
@@ -232,52 +245,6 @@ class ProtocolCodec:
         self.message_name_to_id = {
             name: mid for mid, name in self.message_types.items()
         }
-
-
-    def parse_structs(protocol_hpp: str, constants: dict[str, int]) -> dict[str, PayloadSchema]:
-        schemas: dict[str, PayloadSchema] = {}
-
-        for struct_name, body in STRUCT_DEF_RE.findall(protocol_hpp):
-            fmt = "<"
-            field_names: list[str] = []
-
-            for line in body.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-
-                # std::array<T, N>
-                arr = ARRAY_RE.search(line)
-                if arr:
-                    ctype, count = arr.groups()
-                    count = constants.get(count, int(count))
-                    fmt += CPP_TO_STRUCT[ctype] * count
-
-                    base_name = line.split(">")[-1].split(";")[0].strip()
-                    for i in range(count):
-                        field_names.append(f"{base_name}[{i}]")
-                    continue
-
-                # normal field
-                m = FIELD_RE.match(line)
-                if not m:
-                    continue
-
-                ctype, name, _, arr_count = m.groups()
-                if arr_count:
-                    for i in range(int(arr_count)):
-                        fmt += CPP_TO_STRUCT[ctype]
-                        field_names.append(f"{name}[{i}]")
-                else:
-                    fmt += CPP_TO_STRUCT[ctype]
-                    field_names.append(name)
-
-            schemas[struct_name] = PayloadSchema(
-                struct=struct.Struct(fmt),
-                field_names=field_names,
-            )
-
-        return schemas
 
 
     def encode(self, message_type: MessageType, *args, **fields) -> bytes:

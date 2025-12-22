@@ -5,8 +5,8 @@
 int main(int argc, char* argv[]) {
     try {
         // Default values
-        uint16_t port = 15000;
-        std::size_t io_threads = 2;
+        uint16_t port = 16000;
+        std::size_t io_threads = 3;
 
         // Parse command line arguments
         if (argc > 1) {

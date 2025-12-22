@@ -31,13 +31,14 @@ TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 // Theoretical maximum size of an (IPv4) UDP packet (actual maximum is lower).
 constexpr size_t READ_SIZE = 65535;
 
-Connection::Connection(boost::asio::io_context& context, tcp::socket&& socket, Id_t id)
+Connection::Connection(boost::asio::io_context& context, tcp::socket&& socket, Id_t id, boost::asio::strand<boost::asio::any_io_executor>* exchange_strand)
     : context_(context),
       in_buffer_(),
       out_buffer_(),
       socket_(std::move(socket)),
       id_(id),
-      strand_(socket_.get_executor()) {
+      strand_(socket_.get_executor()),
+      exchange_strand_(exchange_strand) {
         set_name('\'' + std::to_string(socket_.local_endpoint().port()) + '\'');
     }
 
@@ -111,12 +112,13 @@ void Connection::read_some_handler(const boost::system::error_code& error, size_
         }
         const uint8_t* payload_ptr = upto + MESSAGE_HEADER_SIZE;
 
-        RLOG(LG_CON, LogLevel::LL_DEBUG)
-            << std::quoted(name_, '\'')
-            << " received message with type=" << static_cast<int>(message_type)
-            << " and size=" << payload_size;
+        std::vector<uint8_t> payload(payload_ptr, payload_ptr + payload_size);
 
-        on_message_received(message_type, payload_ptr);
+        boost::asio::post(*exchange_strand_,
+            [this, message_type, payload = std::move(payload)]() mutable {
+                on_message_received(message_type, payload.data());
+            }
+        );
 
         upto += payload_size + MESSAGE_HEADER_SIZE;
         available -= payload_size + MESSAGE_HEADER_SIZE;

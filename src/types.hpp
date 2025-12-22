@@ -17,6 +17,7 @@ static constexpr Price_t MAXIMUM_ASK = 10'000;
 static constexpr size_t NUM_BOOK_LEVELS = MAXIMUM_ASK - MINIMUM_BID + 1;
 static constexpr size_t ORDER_BOOK_MESSAGE_DEPTH = 10;
 static constexpr size_t MAX_TRADES_PER_TICK = 100;
+constexpr size_t ERROR_TEXT_LEN = 64;
 
 enum class Lifespan : uint8_t {FILL_AND_KILL, GOOD_FOR_DAY};
 enum class Side : uint8_t {SELL, BUY};

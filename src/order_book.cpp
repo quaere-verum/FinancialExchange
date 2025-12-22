@@ -314,11 +314,20 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     OrderBookSide& side = order->is_bid_ ? bids : asks;
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
-    level.total_quantity_ -= order->quantity_remaining_;
 
-    callbacks_->on_order_cancelled(client_request_id, *order, now);
-    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
+    level.total_quantity_ -= order->quantity_remaining_;
+    if (!level.first_ && side.best_price_index_ == level.idx_) {
+        if (order->is_bid_)
+            side.update_best_bid_after_empty();
+        else
+            side.update_best_ask_after_empty();
+    }
+
+    Order order_snapshot = *order;
     remove_order(order_idx->first, order, side, level);
+
+    callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
+    callbacks_->on_order_cancelled(client_request_id, order_snapshot, now);
 }
 
 void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept {
@@ -373,8 +382,10 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     order->quantity_remaining_ = quantity_new_remaining;
     level.total_quantity_ += delta;
 
-    callbacks_->on_order_amended(client_request_id, quantity_old_total, *order, now);
-    callbacks_->on_level_update(order->is_bid_ ? Side::BUY : Side::SELL, level, now);
+    Order order_snapshot = *order;
+
+    callbacks_->on_order_amended(client_request_id, quantity_old_total, order_snapshot, now);
+    callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
     if (quantity_new_remaining == 0) {
         remove_order(order_idx->first, order, side, level);
     }
@@ -390,14 +401,6 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
         order->next_->previous_ = order->previous_;
     } else {
         level.last_ = order->previous_;
-    }
-
-    level.total_quantity_ -= order->quantity_remaining_;
-    if (!level.first_ && side.best_price_index_ == level.idx_) {
-        if (order->is_bid_)
-            side.update_best_bid_after_empty();
-        else
-            side.update_best_ask_after_empty();
     }
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);

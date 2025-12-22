@@ -77,7 +77,7 @@ void Exchange::do_accept() {
 
 Connection* Exchange::connect(tcp::socket socket) {
     Id_t id = next_connection_id_++;
-    auto connection = std::make_unique<Connection>(context_, std::move(socket), id);
+    auto connection = std::make_unique<Connection>(context_, std::move(socket), id, &strand_);
     Connection* ptr = connection.get();
     ptr->message_received = [this](IConnection* from, Message_t type, const uint8_t* data){
         this->on_message(static_cast<Connection*>(from), type, data);
@@ -136,6 +136,7 @@ void Exchange::on_trade(
     Volume_t traded_quantity,
     Time_t timestamp
 ) {
+    assert(strand_.running_in_this_thread());
     Id_t trade_id = trade_id_++;
     Id_t sequence_number = sequence_number_++;
     PayloadPartialFill maker_fill_message = make_partial_fill(
@@ -150,11 +151,13 @@ void Exchange::on_trade(
 
     auto maker_client = clients_.find(maker_order.client_id_);
     if (maker_client != clients_.end() && maker_client->second) {
+        auto maker_ptr = maker_client->second.get();
         send_to(
-            maker_client->second.get(), 
+            maker_ptr, 
             static_cast<Message_t>(MessageType::PARTIAL_FILL_ORDER), 
             &maker_fill_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent partial fill confirmation to" << maker_ptr->get_name(); 
     }
     PayloadPartialFill taker_fill_message = make_partial_fill(
         taker_order_id,
@@ -168,11 +171,13 @@ void Exchange::on_trade(
 
     auto taker_client = clients_.find(taker_client_id);
     if (taker_client != clients_.end() && taker_client->second) {
+        auto taker_ptr = taker_client->second.get();
         send_to(
-            taker_client->second.get(), 
+            taker_ptr, 
             static_cast<Message_t>(MessageType::PARTIAL_FILL_ORDER), 
             &taker_fill_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent partial fill confirmation to" << taker_ptr->get_name(); 
     }
 
     PayloadTradeEvent trade_message = make_trade_event(
@@ -190,11 +195,13 @@ void Exchange::on_trade(
                 static_cast<Message_t>(MessageType::TRADE_EVENT),
                 &trade_message
             );
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent trade event to" << c->get_name(); 
         }
     }
 }
 
 void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Time_t timestamp) {
+    assert(strand_.running_in_this_thread());
     Id_t sequence_number = sequence_number_++;
 
     PayloadConfirmOrderInserted confirmation_message = make_confirm_order_inserted(
@@ -207,13 +214,15 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
         timestamp
     );
 
-    auto maker_client = clients_.find(order.client_id_);
-    if (maker_client != clients_.end() && maker_client->second) {
+    auto client = clients_.find(order.client_id_);
+    if (client != clients_.end() && client->second) {
+        auto client_ptr = client->second.get();
         send_to(
-            maker_client->second.get(), 
+            client_ptr, 
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_INSERTED), 
             &confirmation_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent insertion confirmation to" << client_ptr->get_name(); 
     }
 
     PayloadOrderInsertedEvent insert_message = make_order_inserted_event(
@@ -231,11 +240,13 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
                 static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT),
                 &insert_message
             );
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent insertion event to" << c->get_name(); 
         }
     }
 }
 
 void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) {
+    assert(strand_.running_in_this_thread());
     Id_t sequence_number = sequence_number_++;
 
     PayloadConfirmOrderCancelled confirmation_message = make_confirm_order_cancelled(
@@ -247,13 +258,15 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
         timestamp
     );
 
-    auto maker_client = clients_.find(order.client_id_);
-    if (maker_client != clients_.end() && maker_client->second) {
+    auto client = clients_.find(order.client_id_);
+    if (client != clients_.end() && client->second) {
+        auto client_ptr = client->second.get();
         send_to(
-            maker_client->second.get(), 
+            client_ptr, 
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_CANCELLED), 
             &confirmation_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent cancel confirmation to" << client_ptr->get_name(); 
     }
 
     PayloadOrderCancelledEvent cancel_message = make_order_cancelled_event(
@@ -269,12 +282,14 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
                 static_cast<Message_t>(MessageType::ORDER_CANCELLED_EVENT),
                 &cancel_message
             );
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent cancel event to" << c->get_name(); 
         }
     }
 }
 
 
 void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, const Order& order, Time_t timestamp) {
+    assert(strand_.running_in_this_thread());
     Id_t sequence_number = sequence_number_++;
 
     PayloadConfirmOrderAmended confirmation_message = make_confirm_order_amended(
@@ -286,13 +301,15 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
         timestamp
     );
 
-    auto maker_client = clients_.find(order.client_id_);
-    if (maker_client != clients_.end() && maker_client->second) {
+    auto client = clients_.find(order.client_id_);
+    if (client != clients_.end() && client->second) {
+        auto client_ptr = client->second.get();
         send_to(
-            maker_client->second.get(), 
+            client_ptr, 
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_AMENDED), 
             &confirmation_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent amendment confirmation to" << client_ptr->get_name(); 
     }
 
     PayloadOrderAmendedEvent amended_message = make_order_amended_event(
@@ -309,11 +326,13 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
                 static_cast<Message_t>(MessageType::ORDER_AMENDED_EVENT),
                 &amended_message
             );
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent amendment event to" << c->get_name(); 
         }
     }
 }
 
 void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timestamp) {
+    assert(strand_.running_in_this_thread());
     Id_t sequence_number = sequence_number_++;
     PayloadPriceLevelUpdate message = make_price_level_update(
         sequence_number,
@@ -329,26 +348,31 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
                 static_cast<Message_t>(MessageType::PRICE_LEVEL_UPDATE),
                 &message
             );
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent level update to" << c->get_name(); 
         }
     }
 }
 
 void Exchange::on_error(Id_t client_id, Id_t client_request_id, uint16_t code, std::string_view message, Time_t timestamp) {
+    assert(strand_.running_in_this_thread());
     PayloadError error_message = make_error(client_request_id, code, message, timestamp);
     auto client = clients_.find(client_id);
     if (client != clients_.end() && client->second) {
+        auto client_ptr = client->second.get();
         send_to(
-            client->second.get(), 
+            client_ptr, 
             static_cast<Message_t>(MessageType::ERROR_MSG), 
             &error_message
         );
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange sent error message(" << message << ") to" << client_ptr->get_name(); 
     }
 }
 
 void Exchange::on_message(Connection* from, Message_t message_type, const uint8_t* payload) {
+    assert(strand_.running_in_this_thread());
     switch (static_cast<MessageType>(message_type)) {
         case MessageType::INSERT_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received insert order: " << from->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received insert order from " << from->get_name(); 
             const PayloadInsertOrder* message = reinterpret_cast<const PayloadInsertOrder*>(payload);
             order_book_.submit_order(
                 message->price,
@@ -359,7 +383,7 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             );
             break;
         } case MessageType::CANCEL_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received cancel order: " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received cancel order from " << from->get_name();
             const PayloadCancelOrder* message = reinterpret_cast<const PayloadCancelOrder*>(payload);
             order_book_.cancel_order(
                 from->id(),
@@ -368,20 +392,20 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             );
             break;
         } case MessageType::AMEND_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received amend request: " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received amend request from " << from->get_name();
             const PayloadAmendOrder* message = reinterpret_cast<const PayloadAmendOrder*>(payload);
             order_book_.amend_order(from->id(), message->client_request_id, message->exchange_order_id, message->new_total_quantity);
             break;
         } case MessageType::SUBSCRIBE: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received subscribe request: " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received subscribe request from " << from->get_name();
             subscribe_market_feed(from);
             break;
         } case MessageType::UNSUBSCRIBE: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received unsubscribe: " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received unsubscribe from " << from->get_name();
             unsubscribe_market_feed(from);
             break;
         } case MessageType::DISCONNECT: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received disconnect request: " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "Exchange received disconnect request from " << from->get_name();
             remove_connection(from);
             break;
         }

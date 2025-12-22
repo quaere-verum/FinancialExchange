@@ -24,6 +24,7 @@ class Exchange : public OrderBookCallbacks {
         void send_to(Connection* client, Message_t message_type, const void* payload);
         void subscribe_market_feed(Connection* client);
         void unsubscribe_market_feed(Connection* client);
+        boost::asio::strand<boost::asio::any_io_executor>& Exchange::strand() noexcept {return strand_;}
 
         void on_trade(
             const Order& maker_order,

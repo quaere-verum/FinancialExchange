@@ -31,8 +31,6 @@ enum class MessageType : Message_t {
     PRICE_LEVEL_UPDATE = 27
 };
 
-constexpr size_t ERROR_TEXT_LEN = 64;
-
 #pragma pack(push, 1)
 
 struct PayloadDisconnect {
