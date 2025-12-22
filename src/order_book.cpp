@@ -2,6 +2,9 @@
 #include <array>
 #include "order_book.hpp"
 #include "time.hpp"
+#include "logging.hpp"
+
+TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
 OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
@@ -86,10 +89,12 @@ void OrderBookSide::update_best_bid_after_empty() noexcept {
     for (size_t i = old_idx; i-- > 0; ) {
         if (levels_[i].total_quantity_ > 0) {
             best_price_index_ = i;
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Updating best bid after empty to p=" << levels_[i].price_ << ".";
             return;
         }
     }
     best_price_index_ = NUM_BOOK_LEVELS;
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Bid side is empty.";
 }
 
 void OrderBookSide::update_best_ask_after_empty() noexcept {
@@ -97,10 +102,12 @@ void OrderBookSide::update_best_ask_after_empty() noexcept {
     for (size_t i = old_idx + 1; i < NUM_BOOK_LEVELS; ++i) {
         if (levels_[i].total_quantity_ > 0) {
             best_price_index_ = i;
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Updating best ask after empty to p=" << levels_[i].price_ << ".";
             return;
         }
     }
     best_price_index_ = NUM_BOOK_LEVELS;
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Ask side is empty.";
 }
 
 template <typename PriceCrossFn, typename BestPriceFn>
@@ -114,6 +121,8 @@ Volume_t OrderBookSide::match_loop(
     BestPriceFn advance_best,
     std::vector<Id_t>& filled_order_ids
 ) noexcept {
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with id=" << order_id 
+    << ", qty=" << incoming_quantity << ", p=" << incoming_price << " entering matching process.";
     Time_t now = utc_now_ns();
     Volume_t total_incoming_quantity = incoming_quantity;
 
@@ -125,6 +134,10 @@ Volume_t OrderBookSide::match_loop(
         if (!crosses(level->price_, incoming_price))
             break;
 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with id=" << order_id 
+        << ", qty=" << incoming_quantity << ", p=" << incoming_price << " being matched at level p=" << level->price_ <<
+        ", qty=" << level->total_quantity_ << ".";
+
         while (incoming_quantity > 0 && level->first_) {
             Order* maker = level->first_;
 
@@ -134,6 +147,8 @@ Volume_t OrderBookSide::match_loop(
             maker->quantity_cumulative_ += trade_quantity;
             incoming_quantity -= trade_quantity;
             level->total_quantity_ -= trade_quantity;
+
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with ID " << order_id << " matched.";
 
             callbacks_->on_trade(
                 *maker,
@@ -235,6 +250,7 @@ void OrderBook::set_callbacks(OrderBookCallbacks* callbacks) {
 }
 
 void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t client_id, Id_t client_request_id) {
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " submitted into order book.";
     Time_t now = utc_now_ns();
     if (quantity == 0) {
         callbacks_->on_error(
@@ -275,6 +291,7 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
             callbacks_->on_order_inserted(client_request_id, *resting_order, now);
         }
     }
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
     for (Id_t order_idx : filled_order_ids_) {
         order_index_.erase(order_idx);
     }
@@ -316,15 +333,16 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     PriceLevel& level = side.levels_[idx];
 
     level.total_quantity_ -= order->quantity_remaining_;
+
+    Order order_snapshot = *order;
+    remove_order(order_idx->first, order, side, level);
+
     if (!level.first_ && side.best_price_index_ == level.idx_) {
         if (order->is_bid_)
             side.update_best_bid_after_empty();
         else
             side.update_best_ask_after_empty();
     }
-
-    Order order_snapshot = *order;
-    remove_order(order_idx->first, order, side, level);
 
     callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
     callbacks_->on_order_cancelled(client_request_id, order_snapshot, now);
@@ -383,6 +401,10 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     level.total_quantity_ += delta;
 
     Order order_snapshot = *order;
+
+    if (level.total_quantity_ == 0) {
+        order_snapshot.is_bid_ ? side.update_best_bid_after_empty() : side.update_best_ask_after_empty();
+    }
 
     callbacks_->on_order_amended(client_request_id, quantity_old_total, order_snapshot, now);
     callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);

@@ -35,6 +35,8 @@ class Trader(abc.ABC):
         self.next_request_id = 1
         self.running = True
 
+        self.lock = threading.Lock()
+
         # ONLY this thread should ever call sock.recv
         self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self.recv_thread.start()
@@ -47,6 +49,10 @@ class Trader(abc.ABC):
         self._partial_fill_buffer: list[dict] = []
 
         self._verbose: bool = False
+
+    def get_open_orders(self) -> dict[int, Order]:
+        with self.lock:
+            return dict(self._open_orders)
 
     def set_verbose(self, val: bool):
         self._verbose = val
@@ -118,49 +124,53 @@ class Trader(abc.ABC):
         return
         
     def _on_confirm_order_inserted(self, fields: dict):
-        self._open_orders[fields["exchange_order_id"]] = Order(
-            fields["price"],
-            fields["total_quantity"],
-            fields["leaves_quantity"],
-            fields["total_quantity"] - fields["leaves_quantity"],
-            Side.SELL if fields["side"] == Side.SELL else Side.BUY
-        )
+        with self.lock:
+            self._open_orders[fields["exchange_order_id"]] = Order(
+                fields["price"],
+                fields["total_quantity"],
+                fields["leaves_quantity"],
+                fields["total_quantity"] - fields["leaves_quantity"],
+                Side.SELL if fields["side"] == Side.SELL else Side.BUY
+            )
         if self._verbose:
             print(f"[{self.name}] Processed confirm order inserted.")
         return
 
     def _on_partial_fill(self, fields: dict):
-        if fields["exchange_order_id"]  not in self._open_orders:
-            # fill messages from insert order matching before it becomes a resting order
-            if self._verbose:
-                print(f"[{self.name}] Partial fill not in open orders.")
-            return
-        
-        leaves_quantity = fields["leaves_quantity"]
-        if leaves_quantity == 0:
-            del self._open_orders[fields["exchange_order_id"]]
-            return
-        order = self._open_orders[fields["exchange_order_id"]]
-        order.quantity_remaining = leaves_quantity
-        order.quantity_cumulative = fields["cumulative_quantity"]
+        with self.lock:
+            if fields["exchange_order_id"]  not in self._open_orders:
+                # fill messages from insert order matching before it becomes a resting order
+                if self._verbose:
+                    print(f"[{self.name}] Partial fill not in open orders.")
+                return
+            
+            leaves_quantity = fields["leaves_quantity"]
+            if leaves_quantity == 0:
+                del self._open_orders[fields["exchange_order_id"]]
+                return
+            order = self._open_orders[fields["exchange_order_id"]]
+            order.quantity_remaining = leaves_quantity
+            order.quantity_cumulative = fields["cumulative_quantity"]
         if self._verbose:
             print(f"[{self.name}] Processed partial fill.")
         return
 
     def _on_confirm_order_cancelled(self, fields: dict):
-        try:
-            del self._open_orders[fields["exchange_order_id"]]
-            if self._verbose:
-                print(f"[{self.name}] Processed order cancelled.")
-        except KeyError:
-            if self._verbose:
-                print(f"[{self.name}] Cancelled order not in open orders.")
-            return
+        with self.lock:
+            try:
+                del self._open_orders[fields["exchange_order_id"]]
+                if self._verbose:
+                    print(f"[{self.name}] Processed order cancelled.")
+            except KeyError:
+                if self._verbose:
+                    print(f"[{self.name}] Cancelled order not in open orders.")
+        return
 
     def _on_confirm_order_amended(self, fields: dict):
-        id = fields["exchange_order_id"]
-        self._open_orders[id].quantity = fields["new_total_quantity"]
-        self._open_orders[id].quantity_remaining = fields["leaves_quantity"]
+        with self.lock:
+            id = fields["exchange_order_id"]
+            self._open_orders[id].quantity = fields["new_total_quantity"]
+            self._open_orders[id].quantity_remaining = fields["leaves_quantity"]
         if self._verbose:
             print(f"[{self.name}] Processed confirm order amended.")
         return

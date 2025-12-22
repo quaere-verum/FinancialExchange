@@ -12,10 +12,17 @@ def test_cancel_vs_match(trader_maker: Trader, trader_taker: Trader, price=100, 
 
         trader_maker.insert_order(price, qty, Side.SELL)
 
-        time.sleep(0.05)
+        time.sleep(0.01)
+        order_id = None
+        for _ in range(100):  # try up to 0.5s
+            open_orders = trader_maker.get_open_orders()
+            if open_orders:
+                order_id = next(iter(open_orders))
+                break
+            time.sleep(0.001)
 
-
-        order_id = next(iter(trader_maker._open_orders.keys()))
+        if order_id is None:
+            raise RuntimeError("Order not confirmed in time")
 
         time.sleep(0.01)
 
@@ -38,7 +45,7 @@ def test_cancel_vs_match(trader_maker: Trader, trader_taker: Trader, price=100, 
         time.sleep(0.05)
 
         # ---- ASSERTIONS ----
-        maker_order = trader_maker._open_orders.get(order_id)
+        maker_order = trader_maker.get_open_orders().get(order_id)
 
         # Either fully filled or fully canceled
         if maker_order is not None:
@@ -50,14 +57,22 @@ def test_cancel_vs_match(trader_maker: Trader, trader_taker: Trader, price=100, 
         )
         assert total_filled <= qty
 
-        maker_open_orders = trader_maker._open_orders.copy()
-        for order_id in maker_open_orders:
-            trader_maker.cancel_order(order_id)
-            time.sleep(0.01)
-        taker_open_orders = trader_taker._open_orders.copy()
-        for order_id in taker_open_orders:
-            trader_taker.cancel_order(order_id)
-            time.sleep(0.01)
+        while True:
+            maker_open_orders = trader_maker.get_open_orders()
+            if len(maker_open_orders) > 0:
+                for order_id in maker_open_orders:
+                    trader_maker.cancel_order(order_id)
+                    time.sleep(0.01)
+            else:
+                break
+        while True:
+            taker_open_orders = trader_taker.get_open_orders()
+            if len(taker_open_orders) > 0:
+                for order_id in trader_taker.get_open_orders():
+                    trader_taker.cancel_order(order_id)
+                    time.sleep(0.01)
+            else:
+                break
         print("=" * 5 + f" {idx} " + 5 * "=")
         time.sleep(0.05)
     print("Test cancel vs. match passed")
@@ -65,13 +80,13 @@ def test_cancel_vs_match(trader_maker: Trader, trader_taker: Trader, price=100, 
 
 def main():
     port = 16000
-    # exchange_path = os.path.join("build", "FinancialExchange.exe")
-    # n_exchange_threads = 3
-    # proc = subprocess.Popen(
-    #     [exchange_path, f"{port}", f"{n_exchange_threads}"],
-    #     stdout=subprocess.DEVNULL,
-    #     stderr=subprocess.DEVNULL,
-    # )
+    exchange_path = os.path.join("build", "FinancialExchange.exe")
+    n_exchange_threads = 3
+    proc = subprocess.Popen(
+        [exchange_path, f"{port}", f"{n_exchange_threads}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     time.sleep(0.25)
 
     trader1 = Trader("TRADER1", "127.0.0.1", port)
