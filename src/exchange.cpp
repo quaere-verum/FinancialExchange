@@ -157,7 +157,7 @@ void Exchange::on_trade(
             static_cast<Message_t>(MessageType::PARTIAL_FILL_ORDER), 
             &maker_fill_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent partial fill confirmation to" << maker_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent partial fill confirmation to " << maker_ptr->get_name(); 
     }
     PayloadPartialFill taker_fill_message = make_partial_fill(
         taker_order_id,
@@ -177,7 +177,7 @@ void Exchange::on_trade(
             static_cast<Message_t>(MessageType::PARTIAL_FILL_ORDER), 
             &taker_fill_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent partial fill confirmation to" << taker_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent partial fill confirmation to " << taker_ptr->get_name(); 
     }
 
     PayloadTradeEvent trade_message = make_trade_event(
@@ -195,7 +195,7 @@ void Exchange::on_trade(
                 static_cast<Message_t>(MessageType::TRADE_EVENT),
                 &trade_message
             );
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent trade event to" << c->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent trade event to " << c->get_name(); 
         }
     }
 }
@@ -222,7 +222,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_INSERTED), 
             &confirmation_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion confirmation to" << client_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion confirmation to " << client_ptr->get_name(); 
     }
 
     PayloadOrderInsertedEvent insert_message = make_order_inserted_event(
@@ -240,7 +240,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
                 static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT),
                 &insert_message
             );
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion event to" << c->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion event to " << c->get_name(); 
         }
     }
 }
@@ -266,7 +266,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_CANCELLED), 
             &confirmation_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel confirmation to" << client_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel confirmation to " << client_ptr->get_name(); 
     }
 
     PayloadOrderCancelledEvent cancel_message = make_order_cancelled_event(
@@ -282,7 +282,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
                 static_cast<Message_t>(MessageType::ORDER_CANCELLED_EVENT),
                 &cancel_message
             );
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel event to" << c->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel event to " << c->get_name(); 
         }
     }
 }
@@ -309,7 +309,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
             static_cast<Message_t>(MessageType::CONFIRM_ORDER_AMENDED), 
             &confirmation_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment confirmation to" << client_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment confirmation to " << client_ptr->get_name(); 
     }
 
     PayloadOrderAmendedEvent amended_message = make_order_amended_event(
@@ -326,7 +326,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
                 static_cast<Message_t>(MessageType::ORDER_AMENDED_EVENT),
                 &amended_message
             );
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment event to" << c->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment event to " << c->get_name(); 
         }
     }
 }
@@ -348,7 +348,7 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
                 static_cast<Message_t>(MessageType::PRICE_LEVEL_UPDATE),
                 &message
             );
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent level update to" << c->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent level update to " << c->get_name(); 
         }
     }
 }
@@ -364,7 +364,7 @@ void Exchange::on_error(Id_t client_id, Id_t client_request_id, uint16_t code, s
             static_cast<Message_t>(MessageType::ERROR_MSG), 
             &error_message
         );
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent error message(" << message << ") to" << client_ptr->get_name(); 
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent error message(" << message << ") to " << client_ptr->get_name(); 
     }
 }
 

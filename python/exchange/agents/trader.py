@@ -177,18 +177,28 @@ class Trader(abc.ABC):
 
     def insert_order(self, price: int, quantity: int, side: Side):
         self._send(MessageType.INSERT_ORDER, self.next_request_id, side, price, quantity, Lifespan.GOOD_FOR_DAY)
+        if self._verbose:
+            print(f"[{self.name}] Sent order insertion request.")
         self.next_request_id += 1
 
     def cancel_order(self, order_id: int):
         self._send(MessageType.CANCEL_ORDER, self.next_request_id, order_id)
+        if self._verbose:
+            print(f"[{self.name}] Sent order cancellation request.")
         self.next_request_id += 1
 
     def amend_order(self, order_id: int, new_volume: int):
         self._send(MessageType.AMEND_ORDER, self.next_request_id, order_id, new_volume)
+        if self._verbose:
+            print(f"[{self.name}] Sent order amendment request.")
         self.next_request_id += 1
 
     def subscribe(self):
         self._send(MessageType.SUBSCRIBE, self.next_request_id)
+        self.next_request_id += 1
+
+    def disconnect(self):
+        self._send(MessageType.DISCONNECT, self.next_request_id)
         self.next_request_id += 1
 
     def print_book(self):
