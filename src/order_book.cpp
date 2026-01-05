@@ -6,6 +6,17 @@
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
+inline void check_level_invariant(const PriceLevel& level) {
+#ifndef NDEBUG
+    int64_t sum_remaining = 0;
+    for (auto* o = level.first_; o; o = o->next_) {
+        sum_remaining += o->quantity_remaining_;
+    }
+    assert(sum_remaining == level.total_quantity_);
+#endif
+}
+
+
 OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
     for (size_t i = 0; i < NUM_BOOK_LEVELS; ++i) {
@@ -44,6 +55,9 @@ Order* OrderBookSide::add_order(
     }
 
     PriceLevel& level = levels_[idx];
+
+    check_level_invariant(level);
+
     Order*& first = level.first_;
     Order*& last = level.last_;
     order->client_id_ = client_id;
@@ -62,12 +76,14 @@ Order* OrderBookSide::add_order(
         first = order;  
     }
     last = order;
-    level.total_quantity_ += quantity;
+    level.total_quantity_ += quantity_remaining;
     callbacks_->on_level_update(is_bid_ ? Side::BUY : Side::SELL, level, now);
     if (is_bid_)
         update_best_bid_after_order(idx);
     else
         update_best_ask_after_order(idx);
+
+    check_level_invariant(level);
 
     return order;
 }
@@ -127,10 +143,15 @@ Volume_t OrderBookSide::match_loop(
     Volume_t total_incoming_quantity = incoming_quantity;
 
     while (incoming_quantity > 0) {
+
+
         if (best_price_index_ == NUM_BOOK_LEVELS)
             break;
 
         PriceLevel* level = &levels_[best_price_index_];
+
+        check_level_invariant(*level);
+
         if (!crosses(level->price_, incoming_price))
             break;
 
@@ -148,7 +169,7 @@ Volume_t OrderBookSide::match_loop(
             incoming_quantity -= trade_quantity;
             level->total_quantity_ -= trade_quantity;
 
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with ID " << order_id << " matched.";
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with ID " << order_id << " matched.";
 
             callbacks_->on_trade(
                 *maker,
@@ -174,6 +195,7 @@ Volume_t OrderBookSide::match_loop(
                 }
                 pool_.deallocate(maker);
             }
+            check_level_invariant(*level);
         }
     }
     return incoming_quantity;
@@ -294,7 +316,7 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
     for (Id_t order_idx : filled_order_ids_) {
         order_index_.erase(order_idx);
-    }
+    }    
 }
 
 void OrderBook::print_book() const {
@@ -332,6 +354,8 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
 
+    check_level_invariant(level);
+
     level.total_quantity_ -= order->quantity_remaining_;
 
     Order order_snapshot = *order;
@@ -346,6 +370,8 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
 
     callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
     callbacks_->on_order_cancelled(client_request_id, order_snapshot, now);
+    
+    check_level_invariant(level);
 }
 
 void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept {
@@ -373,7 +399,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
         );
         return;
     }
-    if (quantity_new < order->quantity_cumulative_) {
+    if (quantity_new <= order->quantity_cumulative_) {
         callbacks_->on_error(
             client_id, 
             client_request_id,
@@ -387,6 +413,8 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     OrderBookSide& side = order->is_bid_ ? bids : asks;
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
+
+    check_level_invariant(level);
 
     Volume_t quantity_old_total = order->quantity_;
     Volume_t quantity_old_remaining = order->quantity_remaining_;
@@ -411,6 +439,8 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     if (quantity_new_remaining == 0) {
         remove_order(order_idx->first, order, side, level);
     }
+    
+    check_level_invariant(level);
 }
 
 void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level) {
