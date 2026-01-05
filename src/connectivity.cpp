@@ -42,8 +42,8 @@ Connection::Connection(
       out_buffer_(),
       socket_(std::move(socket)),
       id_(id),
-      strand_(socket_.get_executor()),
-      exchange_strand_(exchange_strand) {
+      io_strand_(socket_.get_executor()),
+      on_message_strand_(exchange_strand) {
         set_name(std::to_string(id));
       }
 
@@ -59,7 +59,7 @@ void Connection::async_read() {
     socket_.async_read_some(
         buf,
         boost::asio::bind_executor(
-            strand_,
+            io_strand_,
             [this](const boost::system::error_code& error, size_t size) {
                 read_some_handler(error, size);
             }
@@ -119,7 +119,7 @@ void Connection::read_some_handler(const boost::system::error_code& error, size_
 
         std::vector<uint8_t> payload(payload_ptr, payload_ptr + payload_size);
 
-        boost::asio::post(*exchange_strand_,
+        boost::asio::post(*on_message_strand_,
             [this, message_type, payload = std::move(payload)]() mutable {
                 on_message_received(message_type, payload.data());
             }
@@ -138,7 +138,7 @@ void Connection::send() {
     socket_.async_write_some(
         out_buffer_.data(),
         boost::asio::bind_executor(
-            strand_,
+            io_strand_,
             [this](const boost::system::error_code& err, size_t sz) {
                 write_some_handler(err, sz);
             }
@@ -151,7 +151,7 @@ void Connection::send(SendMode mode) {
         send();
     } else if (!is_send_posted_) {
         boost::asio::post(
-            strand_,
+            io_strand_,
             [this] {
                 is_send_posted_ = false;
                 if (!is_sending_) {
@@ -171,7 +171,7 @@ void Connection::send_message(Message_t message_type, const void* payload, SendM
     );
 
     boost::asio::post(
-        strand_,
+        io_strand_,
         [this, message_type, mode, copy = std::move(copy)]() mutable {
             const uint16_t payload_size = static_cast<uint16_t>(copy.size());
 
@@ -205,7 +205,7 @@ void Connection::write_some_handler(const boost::system::error_code& error, size
         socket_.async_write_some(
             out_buffer_.data(),
             boost::asio::bind_executor(
-                strand_,
+                io_strand_,
                 [this](const boost::system::error_code& err, size_t sz) {
                     write_some_handler(err, sz);
                 }

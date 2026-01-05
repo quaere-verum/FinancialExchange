@@ -15,7 +15,7 @@ constexpr size_t MESSAGE_HEADER_SIZE = 3;
 
 class Connection : public IConnection {
     public:
-        Connection(boost::asio::io_context& context, tcp::socket&& socket, Id_t id, boost::asio::strand<boost::asio::any_io_executor>* exchange_strand);
+        Connection(boost::asio::io_context& context, tcp::socket&& socket, Id_t id, boost::asio::strand<boost::asio::any_io_executor>* on_message_strand);
         ~Connection() override;
         void async_read() override;
         void send_message(Message_t message_type, const void* payload, SendMode mode) override;
@@ -36,6 +36,6 @@ class Connection : public IConnection {
         bool is_send_posted_ = false;
         tcp::socket socket_;
         Id_t id_;
-        boost::asio::strand<boost::asio::any_io_executor> strand_;
-        boost::asio::strand<boost::asio::any_io_executor>* exchange_strand_;
+        boost::asio::strand<boost::asio::any_io_executor> io_strand_;
+        boost::asio::strand<boost::asio::any_io_executor>* on_message_strand_;
 };

@@ -32,10 +32,18 @@ find_package(Boost REQUIRED COMPONENTS
     chrono
     regex
 )
-file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
-add_executable(${PROJECT_NAME} ${SOURCES})
+file(GLOB_RECURSE EXCHANGE_CORE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
+add_library(exchange_core STATIC ${EXCHANGE_CORE_SOURCES})
+
+target_include_directories(exchange_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(exchange_core PUBLIC
+    Boost::boost
     Boost::system
     Boost::log
     Boost::thread
@@ -48,4 +56,4 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     secur32
 )
 
-target_include_directories(FinancialExchange PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_subdirectory(apps)
