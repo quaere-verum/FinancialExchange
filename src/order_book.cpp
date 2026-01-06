@@ -399,12 +399,42 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
         );
         return;
     }
-    if (quantity_new <= order->quantity_cumulative_) {
+
+    if (quantity_new < order->quantity_cumulative_) {
         callbacks_->on_error(
             client_id, 
             client_request_id,
             static_cast<uint16_t>(ErrorType::INVALID_VOLUME),
             "Invalid order size.",
+            now
+        );
+        return;
+    }
+
+    Volume_t quantity_old_total = order->quantity_;
+    Volume_t quantity_old_remaining = order->quantity_remaining_;
+
+    Volume_t quantity_new_total = quantity_new;
+    Volume_t quantity_new_remaining = quantity_new_total - order->quantity_cumulative_;
+
+    if (quantity_old_remaining < quantity_new_remaining) {
+        callbacks_->on_error(
+            client_id, 
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::INVALID_VOLUME),
+            "Invalid order size.",
+            now
+        );
+        return;
+    }
+
+    Volume_t delta = quantity_old_remaining - quantity_new_remaining;
+
+    if (quantity_new_remaining == quantity_old_remaining) {
+        callbacks_->on_order_amended(
+            client_request_id,
+            quantity_old_total,
+            *order,
             now
         );
         return;
@@ -416,17 +446,14 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
 
     check_level_invariant(level);
 
-    Volume_t quantity_old_total = order->quantity_;
-    Volume_t quantity_old_remaining = order->quantity_remaining_;
-
-    Volume_t quantity_new_total = quantity_new;
-    Volume_t quantity_new_remaining = quantity_new_total - order->quantity_cumulative_;
-
-    Volume_t delta = quantity_new_remaining - quantity_old_remaining;
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "(Pre amend update) level_qty=" << level.total_quantity_ << ", old_remaining_qty=" << order->quantity_remaining_ 
+    << ", new_remaining_qty=" << quantity_new_remaining << "\n";
 
     order->quantity_ = quantity_new_total;
     order->quantity_remaining_ = quantity_new_remaining;
-    level.total_quantity_ += delta;
+    level.total_quantity_ -= delta;
+
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "(Post amend update) level_qty=" << level.total_quantity_ << ", delta=" << delta << "\n";
 
     Order order_snapshot = *order;
 
