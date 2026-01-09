@@ -39,6 +39,8 @@ class MarketSimulator {
                         data
                     );
                 };
+                connection_.async_read();
+                populate_initial_book();
                 cp_.resize(3);
             }
 
@@ -46,6 +48,12 @@ class MarketSimulator {
 
         void start() {
             running_ = true;
+            PayloadSubscribe sub = make_subscribe(0);
+            connection_.send_message(
+                static_cast<Message_t>(MessageType::SUBSCRIBE),
+                &sub,
+                SendMode::ASAP
+            );
             schedule_next_event();
         }
 
@@ -60,6 +68,44 @@ class MarketSimulator {
         double lambda() const noexcept {return lambda_insert_ + lambda_cancel_ + lambda_amend_;}
 
     private:
+        void populate_initial_book() {
+            Price_t initial_mid_price = 1'000;
+            Price_t initial_spread = 4;
+
+            Price_t best_bid_price = initial_mid_price - initial_spread / 2;
+            Price_t best_ask_price = initial_mid_price + initial_spread / 2;
+
+            Volume_t base_qty = 20;
+
+            size_t max_depth = 5;
+            for (size_t depth = 0; depth < max_depth; depth++) {
+                connection_.send_message(
+                    static_cast<Message_t>(MessageType::INSERT_ORDER),
+                    &make_insert_order(
+                        0,
+                        Side::BUY,
+                        best_bid_price - depth,
+                        base_qty * (max_depth - depth),
+                        Lifespan::GOOD_FOR_DAY
+                    ),
+                    SendMode::ASAP
+                );
+
+                connection_.send_message(
+                    static_cast<Message_t>(MessageType::INSERT_ORDER),
+                    &make_insert_order(
+                        0,
+                        Side::SELL,
+                        best_ask_price + depth,
+                        base_qty * (max_depth - depth),
+                        Lifespan::GOOD_FOR_DAY
+                    ),
+                    SendMode::ASAP
+                );
+            }
+
+        }
+        
         void schedule_next_event() {
             const double lambda_tot = lambda();
             if (lambda_tot <= 0.0 || !running_) {
@@ -81,6 +127,7 @@ class MarketSimulator {
                 [this, timer, dt](const boost::system::error_code& ec) {
                     if (!ec && running_) {
                         state_.sync_with_book(shadow_order_book_, dt);
+                        dynamics_.update_intensities(state_, lambda_insert_, lambda_amend_, lambda_cancel_);
                         switch (sample_event_type()) {
                             case EventType::INSERT_ORDER: generate_insert(); break;
                             case EventType::CANCEL_ORDER: generate_cancel(); break;
@@ -130,11 +177,18 @@ class MarketSimulator {
                     order_manager_.on_amend_acknowledged(amend_confirmation);
                     break;
                 }
+                case MessageType::PARTIAL_FILL_ORDER: {
+                    const PayloadPartialFill* partial_fill = reinterpret_cast<const PayloadPartialFill*>(payload);
+                    order_manager_.on_partial_fill(partial_fill);
+                }
                 default: return;
             }
         }
 
         EventType sample_event_type() noexcept {
+            if (!shadow_order_book_.best_bid_price() || !shadow_order_book_.best_ask_price()) {
+                return EventType::INSERT_ORDER;
+            }
             const double l0 = lambda_insert_;
             const double l1 = lambda_cancel_;
             const double l2 = lambda_amend_;
@@ -218,7 +272,7 @@ class MarketSimulator {
         boost::asio::io_context& context_;
         std::unique_ptr<RNG> rng_;
 
-        double lambda_insert_{0.0};
+        double lambda_insert_{1.0};
         double lambda_cancel_{0.0};
         double lambda_amend_{0.0};
         std::vector<double> cp_;

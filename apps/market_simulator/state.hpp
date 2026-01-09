@@ -7,11 +7,17 @@ struct TimeState {
 };
 
 struct PriceState {
-    Price_t best_bid;
-    Price_t best_ask;
-    Price_t mid_price;
+    std::optional<Price_t> best_bid;
+    std::optional<Price_t> best_ask;
+    std::optional<Price_t> spread;
     Price_t last_trade_price;
-    Price_t spread;
+
+    const std::optional<Price_t> mid_price() const {
+        if (best_bid && best_ask) {
+            return (*best_bid + *best_ask) / 2;
+        }
+        return std::nullopt;
+    }
 };
 
 template<size_t N>
@@ -29,15 +35,18 @@ struct LiquidityState {
     std::array<double, N> ask_mean_distances;
     std::array<double, N> ask_variances;
     std::array<double, N> ask_skews;
+
+    bool has_bid_side;
+    bool has_ask_side;
 };
 
 struct VolatilityState {
-    double realised_variance_short;
-    double realised_variance_long;
-    double realised_variance_up;
-    double realised_variance_down;
-    double vol_of_vol;
-    double jump_intensity;
+    double realised_variance_short = 0.0;
+    double realised_variance_long = 0.0;
+    double realised_variance_up = 0.0;
+    double realised_variance_down = 0.0;
+    double vol_of_vol = 0.0;
+    double jump_intensity = 0.0;
 
     double realised_vol_short() const {return std::sqrt(realised_variance_short);}
     double realised_vol_long() const {return std::sqrt(realised_variance_long);}
@@ -46,12 +55,13 @@ struct VolatilityState {
 };
 
 struct FlowState {
-    double traded_volume_ewma;
-    double trade_rate_ewma;
-    double buy_volume_ewma;
-    double sell_volume_ewma;
-    double signed_volume_ewma;
-    double volume_surprise;
+    double abs_volume_ewma = 0.0;
+    double trade_rate_ewma = 0.0;
+    double buy_volume_ewma = 0.0;
+    double sell_volume_ewma = 0.0;
+    double volume_surprise = 0.0;
+    double signed_volume_ewma = 0.0;
+    double flow_imbalance = 0.0;
 };
 
 struct WeightedMoments {
@@ -70,7 +80,7 @@ inline WeightedMoments compute_weighted_moments(
     if (w_sum <= 0.0) return m;
 
     m.mean = x_sum / w_sum;
-    m.variance = x2_sum / w_sum - m.mean * m.mean;
+    m.variance = std::max(0.0, x2_sum / w_sum - m.mean * m.mean);
 
     if (m.variance > 0.0) {
         double std = std::sqrt(m.variance);
@@ -101,8 +111,9 @@ class SimulationState {
             if (last_trade_timestamp_ == 0) {
                 last_trade_price_ = trade->price;
                 last_trade_timestamp_ = trade->timestamp;
+                return;
             }
-            const double dt = (trade->timestamp - last_trade_timestamp_) * 1e-9; // ns -> seconds
+            const double dt = std::max(1e-6, (trade->timestamp - last_trade_timestamp_) * 1e-9); // ns -> seconds
             if (dt <= 0.0) {return;}
             update_vol_state(trade, dt);
             update_flow_state(trade, dt);
@@ -122,63 +133,82 @@ class SimulationState {
             time_state_.time_since_event = dt;
         }
 
-        void update_price_state(const ShadowOrderBook& order_book) {
+        inline void update_price_state(const ShadowOrderBook& order_book) {
             price_state_.best_bid = order_book.best_bid_price();
             price_state_.best_ask = order_book.best_ask_price();
             price_state_.last_trade_price = last_trade_price_;
-            price_state_.mid_price = order_book.mid_price();
-            price_state_.spread = order_book.spread();
+            if (price_state_.best_bid && price_state_.best_ask) {
+                price_state_.spread = *price_state_.best_ask - *price_state_.best_bid;
+            } else {
+                price_state_.spread = std::nullopt;
+            }
         }
 
-        void update_liq_state(const ShadowOrderBook& order_book) {
-            const Price_t best_bid = order_book.best_bid_price();
-            const Price_t best_ask = order_book.best_ask_price();
+        inline void update_liq_state(const ShadowOrderBook& order_book) {
+            const auto best_bid = order_book.best_bid_price();
+            const auto best_ask = order_book.best_ask_price();
+
+            liq_state_.has_bid_side = best_bid.has_value();
+            liq_state_.has_ask_side = best_ask.has_value();
 
             liq_state_.bid_volumes.fill(0);
             liq_state_.ask_volumes.fill(0);
 
-            std::array<double, N> bid_w{}, bid_x{}, bid_x2{}, bid_x3{};
-            std::array<double, N> ask_w{}, ask_x{}, ask_x2{}, ask_x3{};
+            bid_w_.fill(0);
+            bid_x_.fill(0);
+            bid_x2_.fill(0);
+            bid_x3_.fill(0);
 
-            for (const auto& [price, volume] : order_book.bids()) {
-                const double dist = static_cast<double>(best_bid - price);
-                if (dist < 0.0) continue;
+            ask_w_.fill(0);
+            ask_x_.fill(0);
+            ask_x2_.fill(0);
+            ask_x3_.fill(0);
 
-                for (size_t i = 0; i < N; ++i) {
-                    if (dist <= liq_state_.bucket_bounds[i]) {
-                        liq_state_.bid_volumes[i] += volume;
 
-                        const double w = static_cast<double>(volume);
-                        bid_w[i]  += w;
-                        bid_x[i]  += w * dist;
-                        bid_x2[i] += w * dist * dist;
-                        bid_x3[i] += w * dist * dist * dist;
+            if (best_bid) {
+                for (const auto& [price, volume] : order_book.bids()) {
+                    const double dist = static_cast<double>(*best_bid - price);
+                    if (dist < 0.0) continue;
+
+                    for (size_t i = 0; i < N; ++i) {
+                        if (dist <= liq_state_.bucket_bounds[i]) {
+                            liq_state_.bid_volumes[i] += volume;
+
+                            const double w = static_cast<double>(volume);
+                            bid_w_[i]  += w;
+                            bid_x_[i]  += w * dist;
+                            bid_x2_[i] += w * dist * dist;
+                            bid_x3_[i] += w * dist * dist * dist;
+                        }
                     }
                 }
             }
 
-            for (const auto& [price, volume] : order_book.asks()) {
-                const double dist = static_cast<double>(price - best_ask);
-                if (dist < 0.0) continue;
+            if (best_ask) {
+                for (const auto& [price, volume] : order_book.asks()) {
+                    const double dist = static_cast<double>(price - *best_ask);
+                    if (dist < 0.0) continue;
 
-                for (size_t i = 0; i < N; ++i) {
-                    if (dist <= liq_state_.bucket_bounds[i]) {
-                        liq_state_.ask_volumes[i] += volume;
+                    for (size_t i = 0; i < N; ++i) {
+                        if (dist <= liq_state_.bucket_bounds[i]) {
+                            liq_state_.ask_volumes[i] += volume;
 
-                        const double w = static_cast<double>(volume);
-                        ask_w[i]  += w;
-                        ask_x[i]  += w * dist;
-                        ask_x2[i] += w * dist * dist;
-                        ask_x3[i] += w * dist * dist * dist;
+                            const double w = static_cast<double>(volume);
+                            ask_w_[i]  += w;
+                            ask_x_[i]  += w * dist;
+                            ask_x2_[i] += w * dist * dist;
+                            ask_x3_[i] += w * dist * dist * dist;
+                        }
                     }
                 }
             }
+            
 
             constexpr double eps = 1e-9;
 
             for (size_t i = 0; i < N; ++i) {
-                auto bid_m = compute_weighted_moments(bid_w[i], bid_x[i], bid_x2[i], bid_x3[i]);
-                auto ask_m = compute_weighted_moments(ask_w[i], ask_x[i], ask_x2[i], ask_x3[i]);
+                auto bid_m = compute_weighted_moments(bid_w_[i], bid_x_[i], bid_x2_[i], bid_x3_[i]);
+                auto ask_m = compute_weighted_moments(ask_w_[i], ask_x_[i], ask_x2_[i], ask_x3_[i]);
 
                 liq_state_.bid_mean_distances[i] = bid_m.mean;
                 liq_state_.bid_variances[i] = bid_m.variance;
@@ -195,7 +225,7 @@ class SimulationState {
             }
         }
         
-        void update_vol_state(const PayloadTradeEvent* trade, double dt) {
+        inline void update_vol_state(const PayloadTradeEvent* trade, double dt) {
             const double p0 = static_cast<double>(last_trade_price_);
             const double p1 = static_cast<double>(trade->price);
 
@@ -203,6 +233,7 @@ class SimulationState {
             const double r2 = r * r;
 
             VolatilityState& vs = vol_state_;
+            const double vol_prev = std::sqrt(vs.realised_variance_short); // Need this for downstream calculation
 
             const double a_short = 1.0 - std::exp(-dt / TAU_SHORT);
             const double a_long  = 1.0 - std::exp(-dt / TAU_LONG);
@@ -223,22 +254,23 @@ class SimulationState {
             }
 
             const double vol_now  = std::sqrt(vs.realised_variance_short);
-            const double vol_prev = std::sqrt(std::max(vs.realised_variance_short - a_short * r2, 0.0));
             const double dvol = vol_now - vol_prev;
             vs.vol_of_vol = (1.0 - a_short) * vs.vol_of_vol + a_short * (dvol * dvol);
 
-            const double jump_score = std::abs(r) / (vol_now * std::sqrt(dt) + 1e-8);
-            const double a_jump = 1.0 - std::exp(-dt / TAU_JUMP);
+            if (vol_now > VOL_MIN) {
+                const double jump_score = std::abs(r) / (vol_now * std::sqrt(dt) + 1e-8);
+                const double a_jump = 1.0 - std::exp(-dt / TAU_JUMP);
 
-            if (jump_score > 5.0) {
-                vs.jump_intensity = (1.0 - a_jump) * vs.jump_intensity + a_jump * 1.0;
-            } else {
-                vs.jump_intensity *= (1.0 - a_jump);
+                if (jump_score > 5.0) {
+                    vs.jump_intensity = (1.0 - a_jump) * vs.jump_intensity + a_jump * 1.0;
+                } else {
+                    vs.jump_intensity *= (1.0 - a_jump);
+                }
             }
         }
 
-
-        void update_flow_state(const PayloadTradeEvent* trade, double dt) {
+        // TODO: Update on cancel/amend also
+        inline void update_flow_state(const PayloadTradeEvent* trade, double dt) {
             FlowState& fs = flow_state_;
 
             const double vol = static_cast<double>(trade->quantity);
@@ -246,7 +278,7 @@ class SimulationState {
             const double a_rate = 1.0 - std::exp(-dt / TAU_RATE);
             const double a_surp = 1.0 - std::exp(-dt / TAU_SURPRISE);
 
-            fs.traded_volume_ewma = (1.0 - a_flow) * fs.traded_volume_ewma + a_flow * vol;
+            fs.abs_volume_ewma = (1.0 - a_flow) * fs.abs_volume_ewma + a_flow * vol;
 
             const double inst_rate = 1.0 / dt;
 
@@ -263,13 +295,15 @@ class SimulationState {
             const double signed_vol = (trade->taker_side == Side::BUY ? vol : -vol);
 
             fs.signed_volume_ewma = (1.0 - a_flow) * fs.signed_volume_ewma + a_flow * signed_vol;
+            fs.flow_imbalance = std::clamp(fs.signed_volume_ewma / (fs.abs_volume_ewma + 1e-8), -1.0, 1.0);
 
-            const double expected_vol = std::max(fs.traded_volume_ewma, 1e-8);
+            const double expected_vol = std::max(fs.abs_volume_ewma, 1e-8);
 
             const double surprise = (vol - expected_vol) / expected_vol;
 
             fs.volume_surprise = (1.0 - a_surp) * fs.volume_surprise + a_surp * surprise;
         }
+
 
         TimeState time_state_;
         PriceState price_state_;
@@ -280,7 +314,8 @@ class SimulationState {
         Price_t last_trade_price_ = MAXIMUM_ASK + 1;
         Time_t last_trade_timestamp_ = 0;
 
-        double prev_realised_vol_ = 0.0;
+        std::array<double, N> bid_w_{}, bid_x_{}, bid_x2_{}, bid_x3_{};
+        std::array<double, N> ask_w_{}, ask_x_{}, ask_x2_{}, ask_x3_{};
 
         // Decay time in seconds
         static constexpr double TAU_SHORT = 1.0;
@@ -289,4 +324,6 @@ class SimulationState {
         static constexpr double TAU_FLOW = 2.0;
         static constexpr double TAU_RATE = 5.0;
         static constexpr double TAU_SURPRISE = 10.0;
+
+        static constexpr double VOL_MIN = 1e-6;
 };

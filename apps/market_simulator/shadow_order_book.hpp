@@ -1,7 +1,9 @@
 #pragma once
+#include <iostream>
 #include "protocol.hpp"
 #include "types.hpp"
 #include <map>
+#include <optional>
 
 class ShadowOrderBook {
     public:
@@ -9,8 +11,16 @@ class ShadowOrderBook {
             bids_.clear();
             asks_.clear();
             for (size_t idx = 0; idx < snapshot->ask_prices.size(); ++idx) {
-                asks_[snapshot->ask_prices[idx]] = snapshot->ask_volumes[idx];
-                bids_[snapshot->bid_prices[idx]] = snapshot->bid_volumes[idx];
+                Price_t ask_price = snapshot->ask_prices[idx];
+                Price_t bid_price = snapshot->bid_prices[idx];
+                Volume_t ask_volume = snapshot->ask_volumes[idx];
+                Volume_t bid_volume = snapshot->bid_volumes[idx];
+                if (ask_volume > 0) {
+                    asks_[ask_price] = ask_volume;
+                }
+                if (bid_volume > 0) {
+                    bids_[bid_price] = bid_volume;
+                }
             }
         }
 
@@ -20,13 +30,41 @@ class ShadowOrderBook {
                 levels.erase(update->price);
             } else {
                 levels[update->price] = update->total_volume;
-            }
+            }               
         }
 
-        Price_t best_bid_price() const { return bids_.empty() ? MINIMUM_BID : bids_.rbegin()->first;}
-        Price_t best_ask_price() const { return asks_.empty() ? MAXIMUM_ASK : asks_.begin()->first;}
-        Price_t mid_price() const { return static_cast<Price_t>((best_bid_price() + best_ask_price()) / 2);}
-        Price_t spread() const { return best_ask_price() - best_bid_price(); }
+        inline std::optional<Price_t> best_bid_price() const {
+            if (bids_.empty()) {
+                return std::nullopt;
+            } else {
+                return bids_.rbegin()->first;
+            }
+        }
+        inline std::optional<Price_t> best_ask_price() const {
+            if (asks_.empty()) {
+                return std::nullopt;
+            } else {
+                return asks_.begin()->first;
+            }
+        }
+        inline std::optional<Price_t> mid_price() const { 
+            const auto best_bid = best_bid_price();
+            const auto best_ask = best_ask_price();
+            if (!best_bid || !best_ask) {
+                return std::nullopt;
+            } else {
+                return static_cast<Price_t>((best_bid.value() + best_ask.value()) / 2);
+            }
+        }
+        inline std::optional<Price_t> spread() const {
+            const auto best_bid = best_bid_price();
+            const auto best_ask = best_ask_price();
+            if (!best_bid || !best_ask) {
+                return std::nullopt;
+            } else {
+                return static_cast<Price_t>((best_ask.value() - best_bid.value()));
+            }
+        }
 
         Volume_t volume_at(Side side, Price_t price) const {
             const auto& levels = side == Side::BUY ? bids_ : asks_;
