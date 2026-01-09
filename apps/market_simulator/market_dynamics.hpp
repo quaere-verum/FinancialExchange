@@ -164,34 +164,33 @@ class MarketDynamics {
                 near_depth = static_cast<double>(liq.ask_volumes[0]);
             }
 
-            // Baseline size from market activity
-            double base_size = fs.abs_volume_ewma;
+            constexpr double S0 = 25.0;
+            double base_scale = S0 + 0.3 * (fs.abs_volume_ewma - S0);
 
-            // Depth replenishment effect (concave)
-            double depth_factor = std::sqrt(near_depth + 1.0);
+            // Depth effect (concave, capped)
+            double depth_factor = std::sqrt(std::min(near_depth, 500.0) + 1.0);
 
-            // Directional urgency: strong imbalance → smaller orders
+            // Imbalance effect: smaller if strong flow pressure
             double imbalance_factor = 1.0 - 0.5 * std::abs(fs.flow_imbalance);
 
-            // Aggressiveness effect: aggressive orders are smaller
+            // Aggressiveness effect
             double aggressiveness_factor = 0.3 + 0.7 * (1.0 - aggressiveness);
 
-            // Volume surprise tilts size but does not dominate
-            double surprise_factor = std::clamp(1.0 + fs.volume_surprise, 0.5, 2.0);
+            // Volume surprise (moderate)
+            double surprise_factor = std::clamp(1.0 + fs.volume_surprise, 0.8, 1.5);
 
             // Final scale
-            double size_scale =
-                base_size
-                * depth_factor
-                * imbalance_factor
-                * aggressiveness_factor
-                * surprise_factor;
+            double size_scale = base_scale
+                            * depth_factor
+                            * imbalance_factor
+                            * aggressiveness_factor
+                            * surprise_factor;
 
             // Safety floor
             size_scale = std::max(size_scale, 1.0);
 
             // Lognormal dispersion (empirical)
-            double log_qty = std::log(size_scale) + rng->standard_normal();
+            double log_qty = std::log(size_scale) + 0.6 * rng->standard_normal();
 
             Volume_t qty = static_cast<Volume_t>(std::max(1.0, std::exp(log_qty)));
 
