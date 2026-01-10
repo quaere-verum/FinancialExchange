@@ -1,5 +1,6 @@
 #pragma once
 #include "shadow_order_book.hpp"
+#include "pcg32.hpp"
 
 struct TimeState {
     double sim_time;
@@ -64,6 +65,12 @@ struct FlowState {
     double flow_imbalance = 0.0;
 };
 
+struct LatentState {
+    double fair_value = 1000.0;
+    double log_fair_value = std::log(1000.0);
+    double time_since_update = 0.0;
+};
+
 struct WeightedMoments {
     double mean = 0.0;
     double variance = 0.0;
@@ -97,7 +104,8 @@ inline WeightedMoments compute_weighted_moments(
 template<size_t N>
 class SimulationState {
     public:
-        SimulationState(const std::array<Price_t, N>& liquidity_bucket_bounds) {
+        SimulationState(const std::array<Price_t, N>& liquidity_bucket_bounds)
+        : rng_(0, 0) {
             liq_state_.bucket_bounds = liquidity_bucket_bounds;
         }
 
@@ -105,6 +113,7 @@ class SimulationState {
             update_price_state(order_book);
             update_liq_state(order_book);
             update_time_state(dt);
+            update_latent_state(dt);
         }
 
         void on_trade(const PayloadTradeEvent* trade) {
@@ -126,6 +135,7 @@ class SimulationState {
         const LiquidityState<N> liq_state() const {return liq_state_;}
         const VolatilityState vol_state() const {return vol_state_;}
         const FlowState flow_state() const {return flow_state_;}
+        const LatentState latent_state() const {return latent_state_;}
 
     private:
         void update_time_state(double dt) {
@@ -225,6 +235,29 @@ class SimulationState {
             }
         }
         
+        inline void update_latent_state(double dt) {
+            constexpr double mu_log = 6.907755278982137; // precomputed log(1000.0)
+            constexpr double kappa  = 0.15;   // per second
+            constexpr double sigma  = 0.005;  // per sqrt second
+            constexpr double latent_update_interval = 0.1; // seconds
+
+            latent_state_.time_since_update += dt;
+
+            if (latent_state_.time_since_update >= latent_update_interval) {
+                double latent_dt = latent_state_.time_since_update;
+                double z = rng_.standard_normal();
+
+                latent_state_.log_fair_value +=
+                    kappa * (mu_log - latent_state_.log_fair_value) * latent_dt
+                    + sigma * std::sqrt(latent_dt) * z;
+
+                latent_state_.fair_value = std::exp(latent_state_.log_fair_value);
+                latent_state_.time_since_update = 0.0;
+            }
+        }
+
+
+
         inline void update_vol_state(const PayloadTradeEvent* trade, double dt) {
             const double p0 = static_cast<double>(last_trade_price_);
             const double p1 = static_cast<double>(trade->price);
@@ -310,8 +343,12 @@ class SimulationState {
         LiquidityState<N> liq_state_;
         VolatilityState vol_state_;
         FlowState flow_state_;
+        LatentState latent_state_;
 
-        Price_t last_trade_price_ = MAXIMUM_ASK + 1;
+        // Update later to be more general
+        PCGRNG rng_;
+
+        Price_t last_trade_price_ = 0;
         Time_t last_trade_timestamp_ = 0;
 
         std::array<double, N> bid_w_{}, bid_x_{}, bid_x2_{}, bid_x3_{};

@@ -34,6 +34,7 @@ class MarketDynamics {
             const VolatilityState& vs  = state.vol_state();
             const FlowState& fs  = state.flow_state();
             const LiquidityState<N>& liq = state.liq_state();
+            const LatentState& ls = state.latent_state();
 
             // ---------------------------------------------------------------------
             // 1. Choose side (slightly biased by flow imbalance if available)
@@ -75,15 +76,15 @@ class MarketDynamics {
 
             if (side == Side::BUY) {
                 if (ps.best_bid) {
-                    anchor = *ps.best_bid;
+                    anchor = std::max(1.0, std::round(*ps.best_bid * 0.7 + ls.fair_value * 0.3));
                 } else {
-                    anchor = ps.last_trade_price;
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.7 + ls.fair_value * 0.3));
                 }
             } else {
                 if (ps.best_ask) {
-                    anchor = *ps.best_ask;
+                    anchor = std::max(1.0, std::round(*ps.best_ask * 0.7 + ls.fair_value * 0.3));
                 } else {
-                    anchor = ps.last_trade_price;
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.7 + ls.fair_value * 0.3));
                 }
             }
 
@@ -168,7 +169,7 @@ class MarketDynamics {
             double base_scale = S0 + 0.3 * (fs.abs_volume_ewma - S0);
 
             // Depth effect (concave, capped)
-            double depth_factor = std::sqrt(std::min(near_depth, 500.0) + 1.0);
+            double depth_factor = std::sqrt(std::min(near_depth, 100.0) + 1.0);
 
             // Imbalance effect: smaller if strong flow pressure
             double imbalance_factor = 1.0 - 0.5 * std::abs(fs.flow_imbalance);
@@ -185,7 +186,6 @@ class MarketDynamics {
                             * imbalance_factor
                             * aggressiveness_factor
                             * surprise_factor;
-
             // Safety floor
             size_scale = std::max(size_scale, 1.0);
 
@@ -290,6 +290,10 @@ class MarketDynamics {
             double& lambda_amend,
             double& lambda_cancel
         ) {
+            constexpr double base_insert_rate  = 2000.0; // per second
+            constexpr double base_cancel_rate  = 4000.0;
+            constexpr double base_amend_rate   = 1500.0;
+
             const auto& fs = state.flow_state();
             const auto& liq = state.liq_state();
             const auto& vol = state.vol_state();
@@ -299,15 +303,30 @@ class MarketDynamics {
                 depth_near_touch = static_cast<double>(liq.bid_volumes[0] + liq.ask_volumes[0]);
             }
 
-            lambda_insert = 0.3 + 0.5 * std::abs(fs.flow_imbalance) + 0.3 * vol.realised_vol_short() + 0.2 / depth_near_touch;
-            lambda_insert = std::clamp(lambda_insert, 0.05, 5.0);
+            double insert_multiplier =
+                1.0
+                + 0.6 * std::abs(fs.flow_imbalance)
+                + 0.8 * vol.realised_vol_short()
+                + 0.4 / std::max(depth_near_touch, 1.0);
 
-            double total_abs_vol = std::max(fs.abs_volume_ewma, 1.0);
-            lambda_cancel = 0.1 + 0.4 * std::min(total_abs_vol / 100.0, 1.0) + 0.3 * vol.realised_vol_short();
-            lambda_cancel = std::clamp(lambda_cancel, 0.01, 3.0);
+            lambda_insert = base_insert_rate * insert_multiplier;
+           
+            double cancel_multiplier =
+                1.0
+                + 1.2 * vol.realised_vol_short()
+                + 0.8 * std::abs(fs.flow_imbalance)
+                + 0.6 * std::min(fs.abs_volume_ewma / 100.0, 2.0)
+                + 0.5 / std::max(depth_near_touch, 1.0);
 
-            lambda_amend = 0.05 + 0.3 * vol.realised_vol_short() + 0.3 * std::abs(fs.volume_surprise) + 0.2 * std::abs(fs.flow_imbalance);
-            lambda_amend = std::clamp(lambda_amend, 0.01, 2.0);
+            lambda_cancel = base_cancel_rate * cancel_multiplier;
+
+            double amend_multiplier =
+                1.0
+                + 0.9 * vol.realised_vol_short()
+                + 0.6 * std::abs(fs.flow_imbalance)
+                + 0.4 / std::max(depth_near_touch, 1.0);
+
+            lambda_amend = base_amend_rate * amend_multiplier;
         }
 
 

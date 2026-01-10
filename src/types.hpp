@@ -11,7 +11,7 @@ using Time_t = uint64_t;
 using Seq_t = uint64_t;
 using Message_t = uint8_t;
 
-static constexpr size_t MAX_ORDERS = 1'000;
+static constexpr size_t MAX_ORDERS = 100'000;
 static constexpr Price_t MINIMUM_BID = 1;
 static constexpr Price_t MAXIMUM_ASK = 10'000;
 static constexpr size_t NUM_BOOK_LEVELS = MAXIMUM_ASK - MINIMUM_BID + 1;
