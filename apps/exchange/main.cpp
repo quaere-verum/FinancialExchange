@@ -7,6 +7,7 @@ int main(int argc, char* argv[]) {
         // Default values
         uint16_t port = 16000;
         std::size_t io_threads = 3;
+        std::string log_file = "log.csv";
 
         // Parse command line arguments
         if (argc > 1) {
@@ -27,7 +28,11 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        Application app(port, io_threads);
+        if (argc > 3) {
+            log_file = argv[3];
+        }
+
+        Application app(port, io_threads, log_file);
         app.start();
         app.wait();
 

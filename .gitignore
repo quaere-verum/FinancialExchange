@@ -1,6 +1,8 @@
 *.pdb
 *.obj
 *.exe
+*.csv
+logs/
 .vscode/
 build/
 __pycache__/

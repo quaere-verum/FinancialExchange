@@ -12,11 +12,12 @@
 #include "protocol.hpp"
 #include "order_book.hpp"
 #include "callbacks.hpp"
+#include "logging.hpp"
 
 class Exchange : public OrderBookCallbacks {
     public:
         using tcp = boost::asio::ip::tcp;
-        Exchange(boost::asio::io_context& context, uint16_t port);
+        Exchange(boost::asio::io_context& context, uint16_t port, std::string log_file);
         void start();
         void stop();
         void print_book() {order_book_.print_book();};
@@ -57,4 +58,5 @@ class Exchange : public OrderBookCallbacks {
         Id_t next_connection_id_;
         Id_t trade_id_;
         Id_t sequence_number_;
+        CSVLogger csv_logger_;
 };

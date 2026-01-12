@@ -76,15 +76,15 @@ class MarketDynamics {
 
             if (side == Side::BUY) {
                 if (ps.best_bid) {
-                    anchor = std::max(1.0, std::round(*ps.best_bid * 0.7 + ls.fair_value * 0.3));
+                    anchor = std::max(1.0, std::round(*ps.best_bid * 0.8 + ls.fair_value * 0.2));
                 } else {
-                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.7 + ls.fair_value * 0.3));
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.8 + ls.fair_value * 0.2));
                 }
             } else {
                 if (ps.best_ask) {
-                    anchor = std::max(1.0, std::round(*ps.best_ask * 0.7 + ls.fair_value * 0.3));
+                    anchor = std::max(1.0, std::round(*ps.best_ask * 0.8 + ls.fair_value * 0.2));
                 } else {
-                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.7 + ls.fair_value * 0.3));
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.8 + ls.fair_value * 0.2));
                 }
             }
 
@@ -101,9 +101,18 @@ class MarketDynamics {
                     spread_scale = static_cast<double>(*ps.spread);
                 }
 
-                double vol_scale = vs.realised_vol_short() * static_cast<double>(anchor);
-
-                double base_scale = spread_scale + 0.5 * vol_scale + 1e-8;
+                auto vol_long = vs.realised_vol_long();
+                double vol_regime;
+                if (vol_long > 0.0) {
+                    vol_regime = vs.realised_vol_short() / vol_long;
+                } else {
+                    vol_regime = 0.0;
+                }
+                double vol_scale = std::clamp(std::pow(vol_regime, 2.0), 1.0, 25.0);
+                double base_scale = 
+                    1.0
+                    + 0.6 * spread_scale 
+                    + 0.4 * vol_scale;
 
                 // Heavy-tailed placement distance (typical in LOBs)
                 double dist = rng->exponential(1.0 / base_scale);
@@ -112,7 +121,7 @@ class MarketDynamics {
                 dist *= (1.0 + 2.0 * vs.jump_intensity);
 
                 // ---------------------------------------------------------------------
-                // 4. Compute limit price
+                // 4. Compute limit  
                 // ---------------------------------------------------------------------
                 if (side == Side::BUY) {
                     price = static_cast<Price_t>(anchor - dist);
@@ -122,7 +131,7 @@ class MarketDynamics {
                     price = std::min(price, MAXIMUM_ASK);
                 }
             }
-
+            
             // ---------------------------------------------------------------------
             // 5. Size determination
             // ---------------------------------------------------------------------

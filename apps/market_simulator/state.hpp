@@ -237,8 +237,8 @@ class SimulationState {
         
         inline void update_latent_state(double dt) {
             constexpr double mu_log = 6.907755278982137; // precomputed log(1000.0)
-            constexpr double kappa  = 0.15;   // per second
-            constexpr double sigma  = 0.005;  // per sqrt second
+            constexpr double kappa  = 0.05;   // per second
+            constexpr double sigma  = 0.01;  // per sqrt second
             constexpr double latent_update_interval = 0.1; // seconds
 
             latent_state_.time_since_update += dt;

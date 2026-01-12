@@ -5,13 +5,14 @@
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
+Exchange::Exchange(boost::asio::io_context& context, uint16_t port, std::string log_file)
     : context_(context),
     strand_(context_.get_executor()),
     acceptor_(context, tcp::endpoint(tcp::v4(), port)), 
     next_connection_id_(0),
     trade_id_(0),
-    sequence_number_(0) {
+    sequence_number_(0),
+    csv_logger_(log_file) {
         order_book_.set_callbacks(this);
     }
 
@@ -198,6 +199,14 @@ void Exchange::on_trade(
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent trade event to " << c->get_name(); 
         }
     }
+    csv_logger_.log({
+        timestamp,
+        "TRADE",
+        trade_id,
+        false,
+        price,
+        traded_quantity
+    });
 }
 
 void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -243,6 +252,14 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion event to " << c->get_name(); 
         }
     }
+    csv_logger_.log({
+        timestamp,
+        "INSERT",
+        order.order_id_,
+        order.is_bid_,
+        order.price_,
+        order.quantity_remaining_
+    });
 }
 
 void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -285,6 +302,14 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel event to " << c->get_name(); 
         }
     }
+    csv_logger_.log({
+        timestamp,
+        "CANCEL",
+        order.order_id_,
+        order.is_bid_,
+        order.price_,
+        order.quantity_remaining_
+    });
 }
 
 
@@ -329,6 +354,14 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment event to " << c->get_name(); 
         }
     }
+    csv_logger_.log({
+        timestamp,
+        "AMEND",
+        order.order_id_,
+        order.is_bid_,
+        order.price_,
+        order.quantity_remaining_
+    });
 }
 
 void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timestamp) {
