@@ -6,7 +6,7 @@
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-inline void check_level_invariant(const PriceLevel& level) {
+inline void _debug_check_level_invariant(const PriceLevel& level) {
 #ifndef NDEBUG
     int64_t sum_remaining = 0;
     for (auto* o = level.first_; o; o = o->next_) {
@@ -16,6 +16,20 @@ inline void check_level_invariant(const PriceLevel& level) {
 #endif
 }
 
+inline void _debug_check_level_integrity(const OrderBook& order_book) {
+#ifndef NDEBUG
+    if (order_book.bids.best_price_index_ == NUM_BOOK_LEVELS) {
+        return;
+    }
+    if (order_book.asks.best_price_index_ == NUM_BOOK_LEVELS) {
+        return;
+    }
+    const Price_t best_bid = order_book.bids.levels_[order_book.bids.best_price_index_].price_;
+    const Price_t best_ask = order_book.asks.levels_[order_book.asks.best_price_index_].price_;
+    assert(best_bid < best_ask);
+    return;
+#endif
+}
 
 OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
@@ -56,7 +70,7 @@ Order* OrderBookSide::add_order(
 
     PriceLevel& level = levels_[idx];
 
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 
     Order*& first = level.first_;
     Order*& last = level.last_;
@@ -83,7 +97,7 @@ Order* OrderBookSide::add_order(
     else
         update_best_ask_after_order(idx);
 
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 
     return order;
 }
@@ -150,7 +164,7 @@ Volume_t OrderBookSide::match_loop(
 
         PriceLevel* level = &levels_[best_price_index_];
 
-        check_level_invariant(*level);
+        _debug_check_level_invariant(*level);
 
         if (!crosses(level->price_, incoming_price))
             break;
@@ -195,7 +209,7 @@ Volume_t OrderBookSide::match_loop(
                 }
                 pool_.deallocate(maker);
             }
-            check_level_invariant(*level);
+            _debug_check_level_invariant(*level);
         }
     }
     return incoming_quantity;
@@ -316,7 +330,8 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
     for (Id_t order_idx : filled_order_ids_) {
         order_index_.erase(order_idx);
-    }    
+    }
+    _debug_check_level_integrity(*this);
 }
 
 void OrderBook::print_book() const {
@@ -354,7 +369,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
 
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 
     level.total_quantity_ -= order->quantity_remaining_;
 
@@ -371,7 +386,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
     callbacks_->on_order_cancelled(client_request_id, order_snapshot, now);
     
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 }
 
 void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept {
@@ -444,7 +459,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     size_t idx = side.price_to_index(order->price_);
     PriceLevel& level = side.levels_[idx];
 
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "(Pre amend update) level_qty=" << level.total_quantity_ << ", old_remaining_qty=" << order->quantity_remaining_ 
     << ", new_remaining_qty=" << quantity_new_remaining << "\n";
@@ -467,7 +482,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
         remove_order(order_idx->first, order, side, level);
     }
     
-    check_level_invariant(level);
+    _debug_check_level_invariant(level);
 }
 
 void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level) {
