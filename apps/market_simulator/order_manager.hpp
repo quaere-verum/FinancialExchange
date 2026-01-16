@@ -39,9 +39,6 @@ class OrderManager {
                 [this, client_id, exchange_id] {
                     auto it = pending_inserts_.find(client_id);
                     if (it == pending_inserts_.end()) {
-                        #ifndef NDEBUG
-                        std::cout << "[OrderManager] client_id=" << client_id << " not found in pending inserts.\n";
-                        #endif
                         return;
                     }
 
@@ -50,13 +47,6 @@ class OrderManager {
 
                     active_orders_.insert(exchange_id);
                     expiry_queue_.push({hazard_threshold, exchange_id});
-                    #ifndef NDEBUG
-                    std::cout << "[OrderManager] Active orders (" << active_orders_.size() << "): ";
-                    for (const auto& order_id : active_orders_) {
-                        std::cout << order_id << " ";
-                    }
-                    std::cout << "\n";
-                    #endif
                 }
             );
         }
@@ -110,10 +100,6 @@ class OrderManager {
                     << ", cumulative_hazard=" << cumulative_hazard << "\n";
                 #endif
                 if (!active_orders_.erase(entry.exchange_order_id)) {
-                    #ifndef NDEBUG
-                    std::cout << "[OrderManager] Warning: order " << entry.exchange_order_id
-                        << " not in active_orders.\n";
-                    #endif
                     continue;
                 }
 

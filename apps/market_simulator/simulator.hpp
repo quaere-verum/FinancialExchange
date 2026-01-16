@@ -17,9 +17,6 @@
 #include "state.hpp"
 #include "shadow_order_book.hpp"
 
-constexpr double LAMBDA_INSERT_BASE = 5'000.0;
-constexpr double LAMBDA_CANCEL_BASE = 2'500.0;
-
 template <size_t N>
 class MarketSimulator {
     public:

@@ -3,6 +3,13 @@
 #include "order_manager.hpp"
 #include <optional>
 #include <iostream>
+#include <vector>
+
+constexpr double LAMBDA_INSERT_BASE = 5'000.0;
+constexpr double DESIRED_OPEN_ORDERS = 100.0;
+constexpr double BASE_ORDER_SIZE = 25.0;
+constexpr double LAMBDA_CANCEL_BASE = LAMBDA_INSERT_BASE / DESIRED_OPEN_ORDERS;
+
 
 struct InsertDecision {
     Side side;
@@ -59,7 +66,6 @@ class MarketDynamics {
             // 2. Determine price anchor
             // ---------------------------------------------------------------------
             Price_t anchor;
-
             if (side == Side::BUY) {
                 if (ps.best_bid) {
                     anchor = std::max(1.0, std::round(*ps.best_bid * 0.8 + ls.fair_value * 0.2));
@@ -74,8 +80,10 @@ class MarketDynamics {
                 }
             }
 
+            double dist = 0.0;
             if (rng->bernoulli(cross_prob)) {
-                price = side == Side::BUY ? anchor + 1 : anchor - 1;
+                dist = rng->categorical(crossing_ticks_probs_);
+                price = side == Side::BUY ? anchor + static_cast<Price_t>(dist) : anchor - static_cast<Price_t>(dist);
                 price = std::clamp(price, MINIMUM_BID, MAXIMUM_ASK);
             } else {
 
@@ -101,7 +109,7 @@ class MarketDynamics {
                     + 0.4 * vol_scale;
 
                 // Heavy-tailed placement distance (typical in LOBs)
-                double dist = rng->exponential(1.0 / base_scale);
+                dist = rng->exponential(1.0 / base_scale);
 
                 // Increase passivity under jump risk
                 dist *= (1.0 + 2.0 * vs.jump_intensity);
@@ -160,8 +168,7 @@ class MarketDynamics {
                 near_depth = static_cast<double>(liq.ask_volumes[0]);
             }
 
-            constexpr double S0 = 25.0;
-            double base_scale = S0 + 0.3 * (fs.abs_volume_ewma - S0);
+            double base_scale = BASE_ORDER_SIZE + 0.3 * (fs.abs_volume_ewma - BASE_ORDER_SIZE);
 
             // Depth effect (concave, capped)
             double depth_factor = std::sqrt(std::min(near_depth, 100.0) + 1.0);
@@ -189,8 +196,10 @@ class MarketDynamics {
 
             Volume_t qty = static_cast<Volume_t>(std::max(1.0, std::exp(log_qty)));
 
+            double distance_multiplier = std::exp(0.025 * dist);
+
             double u = rng->standard_uniform();
-            double hazard_mass = -std::log(u);
+            double hazard_mass = -std::log(u) / distance_multiplier;
 
             return InsertDecision{
                 side,
@@ -227,10 +236,9 @@ class MarketDynamics {
 
             lambda_insert = LAMBDA_INSERT_BASE * insert_multiplier;
 
-            double congestion = static_cast<double>(open_order_count) / static_cast<double>(MAX_ORDERS);
-            double congestion_multiplier = 1.0 + 4.0 * std::pow(congestion, 3.0);
-            double vol_multiplier = 1.0 + 2.5 * vol.realised_vol_short();
-            double flow_multiplier = 1.0 - 0.5 * std::abs(fs.flow_imbalance);
+            double depth_multiplier = 0.5 + static_cast<double>(open_order_count) / DESIRED_OPEN_ORDERS;
+            double vol_multiplier = 1.0 + 1.5 * std::min(vol.realised_vol_short(), 1.0);
+            double flow_multiplier = 1.0 + 0.8 * std::abs(fs.flow_imbalance);
             flow_multiplier = std::max(flow_multiplier, 0.3);
             double spread_multiplier = 1.0;
             if (ps.spread) {
@@ -239,12 +247,20 @@ class MarketDynamics {
 
             lambda_cancel =
                 LAMBDA_CANCEL_BASE
-                * congestion_multiplier
+                * depth_multiplier
                 * vol_multiplier
                 * flow_multiplier
                 * spread_multiplier;
 
         }
 
+    private:
+        std::vector<double> crossing_ticks_probs_ = {
+            0.60,  // touch
+            0.60 + 0.25,  // 1 tick
+            0.60 + 0.25 + 0.10,  // 2 ticks
+            0.60 + 0.25 + 0.10 + 0.04,  // 3 ticks
+            0.60 + 0.25 + 0.10 + 0.04 + 0.01   // 4 ticks
+        };
 
 };
