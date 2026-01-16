@@ -3,9 +3,16 @@
 
 #include <boost/asio.hpp>
 #include <iostream>
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include "logging.hpp"
 
 int main() {
     try {
+        auto core = boost::log::core::get();
+        core->set_filter(
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_DEBUG
+        );
         boost::asio::io_context io_context;
 
         tcp::resolver resolver(io_context);
@@ -25,10 +32,6 @@ int main() {
             std::make_unique<PCGRNG>(0, 0),
             bounds
         );
-
-        sim.set_amend_intensity(30.0);
-        sim.set_cancel_intensity(30.0);
-        sim.set_insert_intensity(10.0);
 
         sim.start();
 

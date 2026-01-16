@@ -31,6 +31,52 @@ inline void _debug_check_level_integrity(const OrderBook& order_book) {
 #endif
 }
 
+inline void _debug_print_orders(const OrderBook& order_book) {
+#ifndef NDEBUG
+    auto print_side = [](const char* side_name, const OrderBookSide& side) {
+        std::cout << "==== " << side_name << " ====\n";
+
+        for (std::size_t i = 0; i < NUM_BOOK_LEVELS; ++i) {
+            const PriceLevel& level = side.levels_[i];
+
+            if (!level.first_)
+                continue;
+
+            std::cout << "PriceLevel[" << i << "] price=" << level.price_
+                      << " total_qty=" << level.total_quantity_ << "\n";
+
+            const Order* o = level.first_;
+            std::size_t depth = 0;
+
+            while (o) {
+                std::cout << "  [" << depth << "] "
+                          << "order_id=" << o->order_id_
+                          << " client_id=" << o->client_id_
+                          << " price=" << o->price_
+                          << " rem=" << o->quantity_remaining_
+                          << " cum=" << o->quantity_cumulative_
+                          << "\n";
+
+                // Defensive invariant check
+                if (o->next_ && o->next_->previous_ != o) {
+                    std::cout << "  !!! LINK ERROR: next->previous mismatch\n";
+                    break;
+                }
+
+                o = o->next_;
+                ++depth;
+            }
+        }
+    };
+
+    print_side("BIDS", order_book.bids);
+    print_side("ASKS", order_book.asks);
+
+    std::cout << "=========================\n";
+#endif
+}
+
+
 OrderBookSide::OrderBookSide(bool is_bid) : is_bid_(is_bid) {
     best_price_index_ = NUM_BOOK_LEVELS;
     for (size_t i = 0; i < NUM_BOOK_LEVELS; ++i) {
@@ -149,7 +195,7 @@ Volume_t OrderBookSide::match_loop(
     Side maker_side,
     PriceCrossFn crosses,
     BestPriceFn advance_best,
-    std::vector<Id_t>& filled_order_ids
+    std::unordered_map<Id_t, Order*>& order_index
 ) noexcept {
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with id=" << order_id 
     << ", qty=" << incoming_quantity << ", p=" << incoming_price << " entering matching process.";
@@ -198,7 +244,6 @@ Volume_t OrderBookSide::match_loop(
             callbacks_->on_level_update(maker_side, *level, now);
 
             if (maker->quantity_remaining_ == 0) {
-                filled_order_ids.push_back(maker->order_id_);
                 Order* next = maker->next_;
                 level->first_ = next;
                 if (next) {
@@ -207,6 +252,7 @@ Volume_t OrderBookSide::match_loop(
                     level->last_ = nullptr;
                     advance_best();
                 }
+                order_index.erase(maker->order_id_);
                 pool_.deallocate(maker);
             }
             _debug_check_level_invariant(*level);
@@ -221,7 +267,7 @@ Volume_t OrderBookSide::match_buy(
     Volume_t incoming_quantity,
     Id_t order_id,
     Id_t client_id,
-    std::vector<Id_t>& filled_order_ids
+    std::unordered_map<Id_t, Order*>& order_index
 ) noexcept {
     return match_loop(
         incoming_price,
@@ -231,7 +277,7 @@ Volume_t OrderBookSide::match_buy(
         Side::SELL,
         [](Price_t level_price, Price_t incoming) {return level_price <= incoming;},
         [this]() {update_best_ask_after_empty();},
-        filled_order_ids
+        order_index
     );
 }
 
@@ -240,7 +286,7 @@ Volume_t OrderBookSide::match_sell(
     Volume_t incoming_quantity,
     Id_t order_id,
     Id_t client_id,
-    std::vector<Id_t>& filled_order_ids
+    std::unordered_map<Id_t, Order*>& order_index
 ) noexcept {
     return match_loop(
         incoming_price,
@@ -250,7 +296,7 @@ Volume_t OrderBookSide::match_sell(
         Side::BUY,
         [](Price_t level_price, Price_t incoming) {return level_price >= incoming;},
         [this]() {update_best_bid_after_empty();},
-        filled_order_ids
+        order_index
     );
 }
 
@@ -274,7 +320,6 @@ void OrderBookSide::print_side(const char* name) const {
 
 OrderBook::OrderBook() : bids(true), asks(false), order_id_(0), trade_id_(0) {
     order_index_.reserve(MAX_ORDERS);
-    filled_order_ids_.reserve(MAX_TRADES_PER_TICK); // TODO: actually enforce max trades per tick
     asks.set_callbacks(callbacks_);
     bids.set_callbacks(callbacks_);
 }
@@ -310,17 +355,16 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
     }
     Id_t order_id = order_id_++;
     Volume_t remaining = quantity;
-    filled_order_ids_.clear();
 
     if (is_bid) {
-        remaining = asks.match_buy(price, quantity, order_id, client_id, filled_order_ids_);
+        remaining = asks.match_buy(price, quantity, order_id, client_id, order_index_);
         if (remaining > 0) {
             Order* resting_order = bids.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
             order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(0, *resting_order, now);
+            callbacks_->on_order_inserted(client_request_id, *resting_order, now);
         }
     } else {
-        remaining = bids.match_sell(price, quantity, order_id, client_id, filled_order_ids_);
+        remaining = bids.match_sell(price, quantity, order_id, client_id, order_index_);
         if (remaining > 0) {
             Order* resting_order = asks.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
             order_index_[order_id] = resting_order;
@@ -328,9 +372,7 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
         }
     }
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
-    for (Id_t order_idx : filled_order_ids_) {
-        order_index_.erase(order_idx);
-    }
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] order_index_.size()=" << order_index_.size() << "\n";
     _debug_check_level_integrity(*this);
 }
 
@@ -498,6 +540,9 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
     }
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);
+    #ifndef NDEBUG
+    std::cout << "[OrderBook] Order removed.\n";
+    #endif
 }
 
 void OrderBook::build_snapshot(

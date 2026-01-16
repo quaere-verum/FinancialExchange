@@ -17,6 +17,9 @@
 #include "state.hpp"
 #include "shadow_order_book.hpp"
 
+constexpr double LAMBDA_INSERT_BASE = 5'000.0;
+constexpr double LAMBDA_CANCEL_BASE = 2'500.0;
+
 template <size_t N>
 class MarketSimulator {
     public:
@@ -31,7 +34,8 @@ class MarketSimulator {
             , on_message_strand_(context_.get_executor())
             , connection_(context, std::move(socket), 0, &on_message_strand_)
             , state_(liquidity_bucket_bounds)
-            , request_id_(0) {
+            , request_id_(0)
+            , order_manager_(context, connection_, request_id_) {
                 connection_.message_received = [this](IConnection* from, Message_t type, const uint8_t* data) {
                     this->on_message(
                         static_cast<Connection*>(from),
@@ -41,7 +45,6 @@ class MarketSimulator {
                 };
                 connection_.async_read();
                 populate_initial_book();
-                cp_.resize(3);
             }
 
         ~MarketSimulator() {stop();}
@@ -59,14 +62,6 @@ class MarketSimulator {
 
         void stop() {running_ = false;}
 
-        void set_insert_intensity(double lambda) noexcept {lambda_insert_ = lambda;}
-
-        void set_cancel_intensity(double lambda) noexcept {lambda_cancel_ = lambda;}
-
-        void set_amend_intensity(double lambda) noexcept {lambda_amend_ = lambda;}
-
-        double lambda() const noexcept {return lambda_insert_ + lambda_cancel_ + lambda_amend_;}
-
     private:
         void populate_initial_book() {
             Price_t initial_mid_price = 1'000;
@@ -79,10 +74,12 @@ class MarketSimulator {
 
             size_t max_depth = 5;
             for (size_t depth = 0; depth < max_depth; depth++) {
+
+                Id_t buy_request_id = request_id_++;
                 connection_.send_message(
                     static_cast<Message_t>(MessageType::INSERT_ORDER),
                     &make_insert_order(
-                        0,
+                        buy_request_id,
                         Side::BUY,
                         best_bid_price - depth,
                         base_qty * (max_depth - depth),
@@ -90,11 +87,13 @@ class MarketSimulator {
                     ),
                     SendMode::ASAP
                 );
+                order_manager_.register_pending_insert(buy_request_id, 10.0);
 
+                Id_t sell_request_id = request_id_++;
                 connection_.send_message(
                     static_cast<Message_t>(MessageType::INSERT_ORDER),
                     &make_insert_order(
-                        0,
+                        sell_request_id,
                         Side::SELL,
                         best_ask_price + depth,
                         base_qty * (max_depth - depth),
@@ -102,20 +101,15 @@ class MarketSimulator {
                     ),
                     SendMode::ASAP
                 );
+                order_manager_.register_pending_insert(sell_request_id, 10.0);
             }
 
         }
         
         void schedule_next_event() {
-            const double lambda_tot = lambda();
-            if (lambda_tot <= 0.0 || !running_) {
-                return;
-            }
-
-            const double dt = rng_->exponential(lambda_tot);
+            const double dt = rng_->exponential(lambda_insert_);
 
             using steady_duration = boost::asio::steady_timer::duration;
-
             auto timer = std::make_shared<boost::asio::steady_timer>(
                 on_message_strand_,
                 std::chrono::duration_cast<steady_duration>(
@@ -124,21 +118,28 @@ class MarketSimulator {
             );
 
             timer->async_wait(
-                [this, timer, dt](const boost::system::error_code& ec) {
+                [this, timer, dt]
+                (const boost::system::error_code& ec) {
                     if (!ec && running_) {
                         state_.sync_with_book(shadow_order_book_, dt);
-                        dynamics_.update_intensities(state_, lambda_insert_, lambda_amend_, lambda_cancel_);
-                        switch (sample_event_type()) {
-                            case EventType::INSERT_ORDER: generate_insert(); break;
-                            case EventType::CANCEL_ORDER: generate_cancel(); break;
-                            case EventType::AMEND_ORDER:  generate_amend();  break;
-                        }
 
+                        cumulative_hazard_ += lambda_cancel_ * dt;
+                        order_manager_.on_hazard_advanced(cumulative_hazard_);
+
+                        dynamics_.update_intensity(
+                            state_,
+                            order_manager_.open_order_count(),
+                            lambda_insert_,
+                            lambda_cancel_
+                        );
+
+                        generate_insert();
                         schedule_next_event();
                     }
                 }
             );
         }
+
 
 
         void on_message(
@@ -166,18 +167,7 @@ class MarketSimulator {
                     const PayloadConfirmOrderInserted* insert_confirmation = reinterpret_cast<const PayloadConfirmOrderInserted*>(payload);
                     order_manager_.on_insert_acknowledged(insert_confirmation);
                     break;
-                }
-                case MessageType::CONFIRM_ORDER_CANCELLED: {
-                    const PayloadConfirmOrderCancelled* cancel_confirmation = reinterpret_cast<const PayloadConfirmOrderCancelled*>(payload);
-                    order_manager_.on_cancel_acknowledged(cancel_confirmation);
-                    break;
-                }
-                case MessageType::ORDER_AMENDED_EVENT: {
-                    const PayloadConfirmOrderAmended* amend_confirmation = reinterpret_cast<const PayloadConfirmOrderAmended*>(payload);
-                    order_manager_.on_amend_acknowledged(amend_confirmation);
-                    break;
-                }
-                case MessageType::PARTIAL_FILL_ORDER: {
+                } case MessageType::PARTIAL_FILL_ORDER: {
                     const PayloadPartialFill* partial_fill = reinterpret_cast<const PayloadPartialFill*>(payload);
                     order_manager_.on_partial_fill(partial_fill);
                 }
@@ -185,36 +175,10 @@ class MarketSimulator {
             }
         }
 
-        EventType sample_event_type() noexcept {
-            if (!shadow_order_book_.best_bid_price() || !shadow_order_book_.best_ask_price()) {
-                return EventType::INSERT_ORDER;
-            }
-            const double l0 = lambda_insert_;
-            const double l1 = lambda_cancel_;
-            const double l2 = lambda_amend_;
-
-            const double total = l0 + l1 + l2;
-
-            cp_[0] = l0 / total;
-            cp_[1] = (l0 + l1) / total;
-            cp_[2] = 1.0;
-            
-            size_t k = rng_->categorical(cp_);
-
-            switch (k) {
-                case 0:
-                    return EventType::INSERT_ORDER;
-                case 1:
-                    return EventType::CANCEL_ORDER;
-                default:
-                    return EventType::AMEND_ORDER;
-            }
-        }
-
         void generate_insert() {
             Id_t request_id = request_id_++;
-            InsertDecision insert = dynamics_.decide_insert(state_, rng_.get());
-
+            InsertDecision insert = dynamics_.decide_insert(state_, cumulative_hazard_, rng_.get());
+            std::cout << "[MarketSimulator] generate_insert() request_id=" << request_id << "\n";
             PayloadInsertOrder payload = make_insert_order(
                 request_id,
                 insert.side,
@@ -222,7 +186,7 @@ class MarketSimulator {
                 insert.quantity,
                 insert.lifespan
             );
-
+            order_manager_.register_pending_insert(request_id, insert.cancellation_hazard_mass);
             connection_.send_message(
                 static_cast<Message_t>(MessageType::INSERT_ORDER),
                 &payload,
@@ -230,55 +194,17 @@ class MarketSimulator {
             );
         }
 
-        void generate_cancel() {
-            Id_t request_id = request_id_++;
-            std::optional<CancelDecision> cancel = dynamics_.decide_cancel(state_, order_manager_, rng_.get());
-
-            if (!cancel) {
-                return;
-            }
-
-            PayloadCancelOrder payload = make_cancel_order(request_id, cancel->order_id);
-
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::CANCEL_ORDER),
-                &payload,
-                SendMode::ASAP
-            );
-        }
-
-        void generate_amend() {
-            Id_t request_id = request_id_++;
-            std::optional<AmendDecision> amend = dynamics_.decide_amend(state_, order_manager_, rng_.get());
-
-            if (!amend) {
-                return;
-            }
-
-            PayloadAmendOrder payload = make_amend_order(
-                request_id,
-                amend->order_id,
-                amend->new_quantity
-            );
-
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::AMEND_ORDER),
-                &payload,
-                SendMode::ASAP
-            );
-        }
 
     private:
         boost::asio::io_context& context_;
         std::unique_ptr<RNG> rng_;
 
-        double lambda_insert_{1.0};
-        double lambda_cancel_{0.0};
-        double lambda_amend_{0.0};
-        std::vector<double> cp_;
+        double lambda_insert_{LAMBDA_INSERT_BASE};
+        double lambda_cancel_{LAMBDA_CANCEL_BASE};
+        double cumulative_hazard_{0.0};
 
         std::atomic<bool> running_{false};
-        Id_t request_id_;
+        std::atomic<Id_t> request_id_;
 
         ShadowOrderBook shadow_order_book_;
         MarketDynamics<N> dynamics_;

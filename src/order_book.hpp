@@ -20,8 +20,8 @@ struct OrderBookSide {
     OrderBookSide(bool is_bid);
 
     inline size_t price_to_index(Price_t price) const noexcept;
-    Volume_t match_buy(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::vector<Id_t>& filled_order_ids) noexcept;
-    Volume_t match_sell(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::vector<Id_t>& filled_orders_ids) noexcept;
+    Volume_t match_buy(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::unordered_map<Id_t, Order*>& order_index) noexcept;
+    Volume_t match_sell(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::unordered_map<Id_t, Order*>& order_index) noexcept;
     void print_side(const char* name) const;
     Order* add_order(Price_t price, Volume_t quantity, Volume_t quantity_remaining, Id_t id, Id_t client_id, Id_t client_request_id) noexcept;
     void update_best_bid_after_order(size_t price_idx);
@@ -42,7 +42,7 @@ struct OrderBookSide {
             Side maker_side,
             PriceCrossFn crosses,
             BestPriceFn advance_best,
-            std::vector<Id_t>& filled_order_ids
+            std::unordered_map<Id_t, Order*>& order_index
         ) noexcept;
         OrderBookCallbacks* callbacks_;
 };
@@ -71,6 +71,5 @@ struct OrderBook {
         Id_t trade_id_;
         std::unordered_map<Id_t, Order*> order_index_;
         OrderBookCallbacks* callbacks_ = nullptr;
-        std::vector<Id_t> filled_order_ids_;
 };
 

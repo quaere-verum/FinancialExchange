@@ -1,13 +1,39 @@
 #include "application.hpp"
 #include <iostream>
 #include <cstdlib>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include "logging.hpp"
 
 int main(int argc, char* argv[]) {
     try {
+        // somewhere in init code
+        auto core = boost::log::core::get();
+        core->set_filter(
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_DEBUG
+        );
         // Default values
         uint16_t port = 16000;
         std::size_t io_threads = 3;
-        std::string log_file = "log.csv";
+
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+        #if defined(_WIN32) || defined(_WIN64)
+            localtime_s(&tm, &t);
+        #else
+            localtime_r(&t, &tm);
+        #endif
+
+        std::ostringstream oss;
+        oss << "logs/" << std::put_time(&tm, "%Y-%m-%d_%H%M") << ".csv";
+
+        std::string log_file = oss.str();
 
         // Parse command line arguments
         if (argc > 1) {

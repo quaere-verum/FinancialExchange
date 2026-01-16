@@ -213,6 +213,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
     assert(strand_.running_in_this_thread());
     Id_t sequence_number = sequence_number_++;
 
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] on_order_inserted() client_request_id=" << client_request_id << "\n";
     PayloadConfirmOrderInserted confirmation_message = make_confirm_order_inserted(
         client_request_id,
         order.order_id_,
@@ -405,7 +406,7 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
     assert(strand_.running_in_this_thread());
     switch (static_cast<MessageType>(message_type)) {
         case MessageType::INSERT_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received insert order from " << from->get_name(); 
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received insert order from " << from->get_name() << "\n"; 
             const PayloadInsertOrder* message = reinterpret_cast<const PayloadInsertOrder*>(payload);
             order_book_.submit_order(
                 message->price,
@@ -416,7 +417,7 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             );
             break;
         } case MessageType::CANCEL_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received cancel order from " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received cancel order from " << from->get_name() << "\n";
             const PayloadCancelOrder* message = reinterpret_cast<const PayloadCancelOrder*>(payload);
             order_book_.cancel_order(
                 from->id(),
@@ -425,20 +426,20 @@ void Exchange::on_message(Connection* from, Message_t message_type, const uint8_
             );
             break;
         } case MessageType::AMEND_ORDER: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received amend request from " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received amend request from " << from->get_name() << "\n";
             const PayloadAmendOrder* message = reinterpret_cast<const PayloadAmendOrder*>(payload);
             order_book_.amend_order(from->id(), message->client_request_id, message->exchange_order_id, message->new_total_quantity);
             break;
         } case MessageType::SUBSCRIBE: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received subscribe request from " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received subscribe request from " << from->get_name() << "\n";
             subscribe_market_feed(from);
             break;
         } case MessageType::UNSUBSCRIBE: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received unsubscribe from " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received unsubscribe from " << from->get_name() << "\n";
             unsubscribe_market_feed(from);
             break;
         } case MessageType::DISCONNECT: {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received disconnect request from " << from->get_name();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Received disconnect request from " << from->get_name() << "\n";
             remove_connection(from);
             break;
         }

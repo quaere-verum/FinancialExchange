@@ -4,32 +4,18 @@
 #include <optional>
 #include <iostream>
 
-enum struct EventType : uint8_t {
-    INSERT_ORDER = 1,
-    AMEND_ORDER  = 2,
-    CANCEL_ORDER = 3
-};
-
 struct InsertDecision {
     Side side;
     Price_t price;
     Volume_t quantity;
     Lifespan lifespan;
-};
-
-struct CancelDecision {
-    Id_t order_id;
-};
-
-struct AmendDecision {
-    Id_t order_id;
-    Volume_t new_quantity;
+    double cancellation_hazard_mass;
 };
 
 template<size_t N>
 class MarketDynamics {
     public:
-        InsertDecision decide_insert(const SimulationState<N>& state, RNG* rng) const {
+        InsertDecision decide_insert(const SimulationState<N>& state, double cumulative_hazard, RNG* rng) const {
             const PriceState& ps  = state.price_state();
             const VolatilityState& vs  = state.vol_state();
             const FlowState& fs  = state.flow_state();
@@ -203,106 +189,27 @@ class MarketDynamics {
 
             Volume_t qty = static_cast<Volume_t>(std::max(1.0, std::exp(log_qty)));
 
+            double u = rng->standard_uniform();
+            double hazard_mass = -std::log(u);
+
             return InsertDecision{
                 side,
                 price,
                 qty,
-                Lifespan::GOOD_FOR_DAY
-            };
-        }
-
-
-        std::optional<CancelDecision> decide_cancel(const SimulationState<N>& state, const OrderManager& orders, RNG* rng) const {
-            const auto& vs = state.vol_state();
-            const FlowState& fs = state.flow_state();
-            const LiquidityState<N>& liq = state.liq_state();
-
-            double side_score = 0.0;
-            side_score += 0.7 * fs.flow_imbalance;
-            if (liq.has_bid_side && liq.has_ask_side) {
-                side_score += 0.5 * liq.imbalances[0];
-            }
-
-            double buy_prob = 0.5 + 0.25 * std::tanh(side_score);
-            buy_prob = std::clamp(buy_prob, 0.05, 0.95);
-
-            Side side = rng->bernoulli(buy_prob) ? Side::BUY : Side::SELL;
-            auto order_opt = orders.random_order(rng, side);
-            if (!order_opt) return std::nullopt;
-
-            const OrderInfo& order = *order_opt;
-
-            double age_score  = orders.order_age(order, state.time_state().sim_time) / 10.0;
-            double dist_score = orders.distance_from_touch(order, state.price_state()) / 10.0;
-            double depth_score = orders.depth_ahead(order) / 100.0;
-
-            double cancel_score = 0.4 * age_score + 0.3 * dist_score + 0.2 * depth_score + 0.1 * vs.realised_vol_short();
-            cancel_score = std::clamp(cancel_score, 0.0, 1.0);
-
-            if (!rng->bernoulli(cancel_score)) return std::nullopt;
-            return CancelDecision{ order.order_id };
-        }
-
-
-        std::optional<AmendDecision> decide_amend(
-            const SimulationState<N>& state,
-            const OrderManager& orders,
-            RNG* rng
-        ) const {
-            const FlowState& fs = state.flow_state();
-            const LiquidityState<N>& liq = state.liq_state();
-
-            double side_score = 0.0;
-            side_score += 0.7 * fs.flow_imbalance;
-            if (liq.has_bid_side && liq.has_ask_side) {
-                side_score += 0.5 * liq.imbalances[0];
-            }
-
-            double buy_prob = 0.5 + 0.25 * std::tanh(side_score);
-            buy_prob = std::clamp(buy_prob, 0.05, 0.95);
-            Side side = rng->bernoulli(buy_prob) ? Side::BUY : Side::SELL;
-            auto order_opt = orders.random_order(rng, side);
-            if (!order_opt) return std::nullopt;
-
-            const OrderInfo& order = *order_opt;
-            const VolatilityState& vs = state.vol_state();
-
-            double age_score = orders.order_age(order, state.time_state().sim_time) / 10.0;
-            double dist_score = orders.distance_from_touch(order, state.price_state()) / 10.0;
-            double depth_score = orders.depth_ahead(order) / 100.0;
-            double vol_score = vs.realised_vol_short();
-
-            double amend_score = 0.4 * age_score + 0.3 * dist_score + 0.2 * depth_score + 0.1 * vol_score;
-            amend_score = std::clamp(amend_score, 0.0, 1.0);
-
-            amend_score *= (0.8 + 0.4 * rng->standard_uniform());
-            amend_score = std::clamp(amend_score, 0.0, 1.0);
-
-            if (!rng->bernoulli(amend_score)) return std::nullopt;
-
-            double size_scale = static_cast<double>(order.quantity);
-
-            double log_qty = std::log(size_scale) + 0.3 * rng->standard_normal();  // moderate perturbation
-            Volume_t new_qty = static_cast<Volume_t>(std::max(1.0, std::exp(log_qty)));
-            if (new_qty >= order.quantity) return std::nullopt;
-
-            return AmendDecision{
-                order.order_id,
-                new_qty
+                Lifespan::GOOD_FOR_DAY,
+                cumulative_hazard + hazard_mass
             };
         }
 
         
-        void update_intensities(
+        void update_intensity(
             const SimulationState<N>& state,
+            size_t open_order_count,
             double& lambda_insert,
-            double& lambda_amend,
             double& lambda_cancel
         ) {
-            constexpr double base_insert_rate  = 2000.0; // per second
-            constexpr double base_cancel_rate  = 4000.0;
-            constexpr double base_amend_rate   = 1500.0;
 
+            const auto& ps = state.price_state();
             const auto& fs = state.flow_state();
             const auto& liq = state.liq_state();
             const auto& vol = state.vol_state();
@@ -318,24 +225,25 @@ class MarketDynamics {
                 + 0.8 * vol.realised_vol_short()
                 + 0.4 / std::max(depth_near_touch, 1.0);
 
-            lambda_insert = base_insert_rate * insert_multiplier;
-           
-            double cancel_multiplier =
-                1.0
-                + 1.2 * vol.realised_vol_short()
-                + 0.8 * std::abs(fs.flow_imbalance)
-                + 0.6 * std::min(fs.abs_volume_ewma / 100.0, 2.0)
-                + 0.5 / std::max(depth_near_touch, 1.0);
+            lambda_insert = LAMBDA_INSERT_BASE * insert_multiplier;
 
-            lambda_cancel = base_cancel_rate * cancel_multiplier;
+            double congestion = static_cast<double>(open_order_count) / static_cast<double>(MAX_ORDERS);
+            double congestion_multiplier = 1.0 + 4.0 * std::pow(congestion, 3.0);
+            double vol_multiplier = 1.0 + 2.5 * vol.realised_vol_short();
+            double flow_multiplier = 1.0 - 0.5 * std::abs(fs.flow_imbalance);
+            flow_multiplier = std::max(flow_multiplier, 0.3);
+            double spread_multiplier = 1.0;
+            if (ps.spread) {
+                spread_multiplier = 1.0 + 0.3 * static_cast<double>(*ps.spread);
+            }
 
-            double amend_multiplier =
-                1.0
-                + 0.9 * vol.realised_vol_short()
-                + 0.6 * std::abs(fs.flow_imbalance)
-                + 0.4 / std::max(depth_near_touch, 1.0);
+            lambda_cancel =
+                LAMBDA_CANCEL_BASE
+                * congestion_multiplier
+                * vol_multiplier
+                * flow_multiplier
+                * spread_multiplier;
 
-            lambda_amend = base_amend_rate * amend_multiplier;
         }
 
 
