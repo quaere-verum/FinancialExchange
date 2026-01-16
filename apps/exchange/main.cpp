@@ -15,7 +15,7 @@ int main(int argc, char* argv[]) {
         // somewhere in init code
         auto core = boost::log::core::get();
         core->set_filter(
-            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_DEBUG
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_INFO
         );
         // Default values
         uint16_t port = 16000;

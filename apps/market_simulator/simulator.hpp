@@ -172,7 +172,9 @@ class MarketSimulator {
         void generate_insert() {
             Id_t request_id = request_id_++;
             InsertDecision insert = dynamics_.decide_insert(state_, order_manager_.cumulative_hazard(), rng_.get());
+            #ifndef NDEBUG
             std::cout << "[MarketSimulator] generate_insert() request_id=" << request_id << "\n";
+            #endif
             PayloadInsertOrder payload = make_insert_order(
                 request_id,
                 insert.side,
