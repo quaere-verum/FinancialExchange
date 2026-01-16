@@ -6,9 +6,9 @@
 #include <vector>
 
 constexpr double LAMBDA_INSERT_BASE = 5'000.0;
-constexpr double DESIRED_OPEN_ORDERS = 100.0;
+constexpr double CANCEL_SCALING_FACTOR = 10'000.0;
 constexpr double BASE_ORDER_SIZE = 25.0;
-constexpr double LAMBDA_CANCEL_BASE = LAMBDA_INSERT_BASE / DESIRED_OPEN_ORDERS;
+constexpr double LAMBDA_CANCEL_BASE = LAMBDA_INSERT_BASE / CANCEL_SCALING_FACTOR;
 
 
 struct InsertDecision {
@@ -236,7 +236,7 @@ class MarketDynamics {
 
             lambda_insert = LAMBDA_INSERT_BASE * insert_multiplier;
 
-            double depth_multiplier = 0.5 + static_cast<double>(open_order_count) / DESIRED_OPEN_ORDERS;
+            double depth_multiplier = 0.5 + static_cast<double>(open_order_count) / CANCEL_SCALING_FACTOR;
             double vol_multiplier = 1.0 + 1.5 * std::min(vol.realised_vol_short(), 1.0);
             double flow_multiplier = 1.0 + 0.8 * std::abs(fs.flow_imbalance);
             flow_multiplier = std::max(flow_multiplier, 0.3);

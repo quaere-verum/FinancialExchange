@@ -119,10 +119,7 @@ class MarketSimulator {
                 (const boost::system::error_code& ec) {
                     if (!ec && running_) {
                         state_.sync_with_book(shadow_order_book_, dt);
-
-                        cumulative_hazard_ += lambda_cancel_ * dt;
-                        order_manager_.on_hazard_advanced(cumulative_hazard_);
-
+                        order_manager_.update_cancel_rate(lambda_cancel_);
                         dynamics_.update_intensity(
                             state_,
                             order_manager_.open_order_count(),
@@ -174,7 +171,7 @@ class MarketSimulator {
 
         void generate_insert() {
             Id_t request_id = request_id_++;
-            InsertDecision insert = dynamics_.decide_insert(state_, cumulative_hazard_, rng_.get());
+            InsertDecision insert = dynamics_.decide_insert(state_, order_manager_.cumulative_hazard(), rng_.get());
             std::cout << "[MarketSimulator] generate_insert() request_id=" << request_id << "\n";
             PayloadInsertOrder payload = make_insert_order(
                 request_id,
@@ -198,7 +195,6 @@ class MarketSimulator {
 
         double lambda_insert_{LAMBDA_INSERT_BASE};
         double lambda_cancel_{LAMBDA_CANCEL_BASE};
-        double cumulative_hazard_{0.0};
 
         std::atomic<bool> running_{false};
         std::atomic<Id_t> request_id_;
