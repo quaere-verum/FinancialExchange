@@ -12,7 +12,7 @@
 
 class Application {
     public:
-        explicit Application(uint16_t port, size_t num_threads = 1, std::string log_file = "logs.csv");
+        explicit Application(uint16_t port, size_t num_threads = 1);
 
         void start();
         void stop();

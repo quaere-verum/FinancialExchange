@@ -241,7 +241,6 @@ Volume_t OrderBookSide::match_loop(
                 trade_quantity,
                 now
             );
-            callbacks_->on_level_update(maker_side, *level, now);
 
             if (maker->quantity_remaining_ == 0) {
                 Order* next = maker->next_;
@@ -257,6 +256,7 @@ Volume_t OrderBookSide::match_loop(
             }
             _debug_check_level_invariant(*level);
         }
+        callbacks_->on_level_update(maker_side, *level, now);
     }
     return incoming_quantity;
 }

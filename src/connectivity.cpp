@@ -177,9 +177,10 @@ void Connection::send_message(Message_t message_type, const void* payload, SendM
 
             auto buf = out_buffer_.prepare(copy.size() + MESSAGE_HEADER_SIZE);
             auto* data = static_cast<uint8_t*>(buf.data());
-            data[0] = static_cast<uint8_t>(message_type);
-            std::memcpy(data + 1, &payload_size, sizeof(payload_size));
-            std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), payload_size);
+            serialize_message(data, static_cast<MessageType>(message_type), copy.data(), payload_size);
+            // data[0] = static_cast<uint8_t>(message_type);
+            // std::memcpy(data + 1, &payload_size, sizeof(payload_size));
+            // std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), payload_size);
             out_buffer_.commit(copy.size() + MESSAGE_HEADER_SIZE);
 
             if (!is_sending_) {

@@ -57,7 +57,7 @@ class MarketDynamics {
 
             cross_prob += 0.2 * std::abs(fs.flow_imbalance);
             cross_prob += 0.2 * vs.realised_vol_short();
-            cross_prob = std::clamp(cross_prob, 0.0, 0.4);
+            cross_prob = std::clamp(cross_prob, 0.1, 0.7);
 
             
             Price_t price;
@@ -66,17 +66,20 @@ class MarketDynamics {
             // 2. Determine price anchor
             // ---------------------------------------------------------------------
             Price_t anchor;
+            constexpr double best_price_weight = 0.6;
+            constexpr double fair_value_weight = 0.4;
+
             if (side == Side::BUY) {
                 if (ps.best_bid) {
-                    anchor = std::max(1.0, std::round(*ps.best_bid * 0.8 + ls.fair_value * 0.2));
+                    anchor = std::max(1.0, std::round(*ps.best_bid * best_price_weight + ls.fair_value * fair_value_weight));
                 } else {
-                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.8 + ls.fair_value * 0.2));
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * best_price_weight + ls.fair_value * fair_value_weight));
                 }
             } else {
                 if (ps.best_ask) {
-                    anchor = std::max(1.0, std::round(*ps.best_ask * 0.8 + ls.fair_value * 0.2));
+                    anchor = std::max(1.0, std::round(*ps.best_ask * best_price_weight + ls.fair_value * fair_value_weight));
                 } else {
-                    anchor = std::max(1.0, std::round(ps.last_trade_price * 0.8 + ls.fair_value * 0.2));
+                    anchor = std::max(1.0, std::round(ps.last_trade_price * best_price_weight + ls.fair_value * fair_value_weight));
                 }
             }
 

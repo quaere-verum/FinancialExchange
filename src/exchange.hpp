@@ -6,6 +6,7 @@
 #include <memory>
 #include <functional>
 #include <vector>
+#include "binary_logger.hpp"
 
 #include "connectivity.hpp"
 #include "types.hpp"
@@ -17,7 +18,7 @@
 class Exchange : public OrderBookCallbacks {
     public:
         using tcp = boost::asio::ip::tcp;
-        Exchange(boost::asio::io_context& context, uint16_t port, std::string log_file);
+        Exchange(boost::asio::io_context& context, uint16_t port);
         void start();
         void stop();
         void print_book() {order_book_.print_book();};
@@ -58,5 +59,5 @@ class Exchange : public OrderBookCallbacks {
         Id_t next_connection_id_;
         Id_t trade_id_;
         Id_t sequence_number_;
-        CSVLogger csv_logger_;
+        BinaryEventLogger event_logger_;
 };

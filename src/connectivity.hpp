@@ -1,5 +1,6 @@
 #pragma once
 #include "types.hpp"
+#include "protocol.hpp"
 #include <functional>
 #include <vector>
 #include <boost/asio/io_context.hpp>
@@ -11,6 +12,19 @@
 using boost::asio::ip::tcp;
 
 constexpr size_t MESSAGE_HEADER_SIZE = 3;
+
+inline void serialize_message(
+    uint8_t* dst,
+    MessageType type,
+    const void* payload,
+    uint16_t payload_size
+) {
+    dst[0] = static_cast<uint8_t>(type);
+
+    std::memcpy(dst + 1, &payload_size, sizeof(payload_size));
+
+    std::memcpy(dst + MESSAGE_HEADER_SIZE, payload, payload_size);
+}
 
 
 class Connection : public IConnection {

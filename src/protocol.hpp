@@ -189,6 +189,34 @@ struct PayloadPriceLevelUpdate {
 
 #pragma pack(pop)
 
+constexpr size_t MAX_PAYLOAD_SIZE = []() {
+    size_t sizes[] = {
+        sizeof(PayloadDisconnect),
+        sizeof(PayloadInsertOrder),
+        sizeof(PayloadCancelOrder),
+        sizeof(PayloadAmendOrder),
+        sizeof(PayloadSubscribe),
+        sizeof(PayloadUnsubscribe),
+        sizeof(PayloadOrderStatusRequest),
+        sizeof(PayloadError),
+        sizeof(PayloadConfirmOrderInserted),
+        sizeof(PayloadConfirmOrderCancelled),
+        sizeof(PayloadConfirmOrderAmended),
+        sizeof(PayloadPartialFill),
+        sizeof(PayloadOrderStatus),
+        sizeof(PayloadOrderBookSnapshot),
+        sizeof(PayloadTradeTicks),
+        sizeof(PayloadTradeEvent),
+        sizeof(PayloadOrderInsertedEvent),
+        sizeof(PayloadOrderCancelledEvent),
+        sizeof(PayloadOrderAmendedEvent),
+        sizeof(PayloadPriceLevelUpdate)
+    };
+    size_t m = 0;
+    for (size_t s : sizes) if (s > m) m = s;
+    return m;
+}();
+
 inline size_t payload_size_for_type(MessageType t) {
     switch (t) {
         case MessageType::DISCONNECT: return sizeof(PayloadDisconnect);

@@ -1,19 +1,20 @@
 #include "application.hpp"
 #include <iostream>
+#include <stdio.h>
 
-Application::Application(uint16_t port, size_t num_threads, std::string log_file)
+Application::Application(uint16_t port, size_t num_threads)
     : io_context_(),
     signals_(io_context_, SIGINT, SIGTERM),
     port_(port) {
-    work_guard_.emplace(io_context_.get_executor());
-    exchange_ = std::make_unique<Exchange>(io_context_, port, log_file);
-    threads_.reserve(num_threads);
-    signals_.async_wait(
-        [this](const boost::system::error_code&, int) {
-            this->stop();
-        }
-    );
-}
+        work_guard_.emplace(io_context_.get_executor());
+        exchange_ = std::make_unique<Exchange>(io_context_, port);
+        threads_.reserve(num_threads);
+        signals_.async_wait(
+            [this](const boost::system::error_code&, int) {
+                this->stop();
+            }
+        );
+    }
 
 void Application::start() {
     if (running_.exchange(true)) {return;}

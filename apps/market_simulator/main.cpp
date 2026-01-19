@@ -13,13 +13,11 @@ int main() {
     try {
         size_t n_simulators = 5;
 
-        // Setup logging filter
         auto core = boost::log::core::get();
         core->set_filter(
             boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_WARNING
         );
 
-        // Bounds for the simulator
         const std::array<Price_t, 3> bounds = {1, 5, 10};
 
         // Threads to hold simulators
@@ -55,7 +53,6 @@ int main() {
             });
         }
 
-        // Wait for all simulators to finish (they likely run indefinitely)
         for (auto& t : threads) {
             t.join();
         }

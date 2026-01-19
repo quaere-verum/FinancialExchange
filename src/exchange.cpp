@@ -5,14 +5,14 @@
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-Exchange::Exchange(boost::asio::io_context& context, uint16_t port, std::string log_file)
+Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
     : context_(context),
     strand_(context_.get_executor()),
     acceptor_(context, tcp::endpoint(tcp::v4(), port)), 
     next_connection_id_(0),
     trade_id_(0),
     sequence_number_(0),
-    csv_logger_(log_file) {
+    event_logger_(make_timestamped_filename("logs")) {
         order_book_.set_callbacks(this);
     }
 
@@ -90,7 +90,7 @@ Connection* Exchange::connect(tcp::socket socket) {
 }
 
 void Exchange::subscribe_market_feed(Connection* client) {
-    Id_t sequence_number = sequence_number_++;
+    Id_t sequence_number = sequence_number_; // Do not increment, simply share the latest sequence_number_ with the client
     market_data_subscribers_.push_back(client);
 
     std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH> bid_volumes;
@@ -199,14 +199,8 @@ void Exchange::on_trade(
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent trade event to " << c->get_name(); 
         }
     }
-    csv_logger_.log({
-        timestamp,
-        "TRADE",
-        trade_id,
-        false,
-        price,
-        traded_quantity
-    });
+
+    event_logger_.log_message(MessageType::TRADE_EVENT, &trade_message);
 }
 
 void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -253,14 +247,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent insertion event to " << c->get_name(); 
         }
     }
-    csv_logger_.log({
-        timestamp,
-        "INSERT",
-        order.order_id_,
-        order.is_bid_,
-        order.price_,
-        order.quantity_remaining_
-    });
+    event_logger_.log_message(MessageType::ORDER_INSERTED_EVENT, &insert_message);
 }
 
 void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -303,14 +290,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent cancel event to " << c->get_name(); 
         }
     }
-    csv_logger_.log({
-        timestamp,
-        "CANCEL",
-        order.order_id_,
-        order.is_bid_,
-        order.price_,
-        order.quantity_remaining_
-    });
+    event_logger_.log_message(MessageType::ORDER_CANCELLED_EVENT, &cancel_message);
 }
 
 
@@ -355,14 +335,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent amendment event to " << c->get_name(); 
         }
     }
-    csv_logger_.log({
-        timestamp,
-        "AMEND",
-        order.order_id_,
-        order.is_bid_,
-        order.price_,
-        order.quantity_remaining_
-    });
+    event_logger_.log_message(MessageType::ORDER_AMENDED_EVENT, &amended_message);
 }
 
 void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timestamp) {
@@ -385,6 +358,7 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[Exchange] Sent level update to " << c->get_name(); 
         }
     }
+    event_logger_.log_message(MessageType::PRICE_LEVEL_UPDATE, &message);
 }
 
 void Exchange::on_error(Id_t client_id, Id_t client_request_id, uint16_t code, std::string_view message, Time_t timestamp) {
