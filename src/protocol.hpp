@@ -33,6 +33,11 @@ enum class MessageType : Message_t {
 
 #pragma pack(push, 1)
 
+struct MessageHeader {
+    MessageType type;
+    uint16_t size;
+};
+
 struct PayloadDisconnect {
     Id_t client_request_id;
 };

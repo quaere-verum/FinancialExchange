@@ -1,12 +1,8 @@
 #pragma once
-#include "windows.h"
 #include "types.hpp"
 #include "protocol.hpp"
 #include "connectivity.hpp"
-#include "types.hpp"
-#include <fcntl.h>
 #include <cassert>
-#include <cerrno>
 #include <cstdlib>
 #include <windows.h>
 #include <atomic>
@@ -20,6 +16,10 @@
 #include <ctime>
 #include <sstream>
 #include <iomanip>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <optional>
 
 inline std::string make_timestamped_filename(const std::string& dir) {
     auto now = std::chrono::system_clock::now();
@@ -38,182 +38,8 @@ inline std::string make_timestamped_filename(const std::string& dir) {
     return oss.str();
 }
 
-
-// template<typename T, size_t Capacity>
-// class SpscRingBuffer {
-//     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of two");
-//     static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
-//     public:
-//         SpscRingBuffer() noexcept
-//         : head_(0)
-//         , tail_(0) 
-//         {}
-
-//         bool push(const T& item) noexcept {
-//             const size_t head = head_.load(std::memory_order_relaxed);
-//             const size_t next = head + 1;
-
-//             if (next - tail_.load(std::memory_order_acquire) > Capacity) {
-//                 return false;
-//             }
-
-//             buffer_[head & mask_] = item;
-//             head_.store(next, std::memory_order_release);
-//             return true;
-//         }
-        
-//         bool pop(T& out) noexcept {
-//             const size_t tail = tail_.load(std::memory_order_relaxed);
-
-//             if (tail == head_.load(std::memory_order_acquire)) {
-//                 return false;
-//             }
-
-//             out = buffer_[tail & mask_];
-//             tail_.store(tail + 1, std::memory_order_release);
-//             return true;
-//         }
-
-//     private:
-//         static constexpr size_t mask_ = Capacity - 1;
-
-//         alignas(64) std::atomic<size_t> head_;
-//         alignas(64) std::atomic<size_t> tail_;
-//         alignas(64) T buffer_[Capacity];
-// };
-
-
-// using LogBuffer = std::vector<uint8_t>;
-
-// class BinaryEventLogger {
-//     public:
-        // explicit BinaryEventLogger(const std::string& file)
-        //     : running_(true) {
-
-        //     file_ = ::CreateFileA(
-        //         file.c_str(),
-        //         GENERIC_WRITE,
-        //         FILE_SHARE_READ,
-        //         nullptr,
-        //         OPEN_ALWAYS,
-        //         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        //         nullptr
-        //     );
-
-        //     if (file_ == INVALID_HANDLE_VALUE) {
-        //         throw std::runtime_error("Failed to open binary log file");
-        //     }
-
-        //     ::SetFilePointer(file_, 0, nullptr, FILE_END);
-
-        //     writer_ = std::thread(&BinaryEventLogger::writer_loop, this);
-        // }
-
-        // ~BinaryEventLogger() {
-        //     running_.store(false, std::memory_order_release);
-
-        //     if (writer_.joinable()) {
-        //         writer_.join();
-        //     }
-
-        //     if (file_ != INVALID_HANDLE_VALUE) {
-        //         ::FlushFileBuffers(file_);
-        //         ::CloseHandle(file_);
-        //     }
-        // }
-
-//         inline void log_message(
-//             MessageType message_type,
-//             const void* payload
-//         ) noexcept {
-//             uint16_t payload_size = payload_size_for_type(message_type);
-//             auto* buf = new LogBuffer;
-//             buf->resize(MESSAGE_HEADER_SIZE + payload_size);
-
-//             serialize_message(
-//                 buf->data(),
-//                 message_type,
-//                 static_cast<const uint8_t*>(payload),
-//                 payload_size
-//             );
-
-//             queue_.push(buf);
-//         }
-
-//     private:
-//         void writer_loop() {
-//             constexpr size_t BATCH_SIZE = 1024;
-
-//             std::vector<LogBuffer*> batch;
-//             batch.reserve(BATCH_SIZE);
-
-//             LogBuffer* buf = nullptr;
-
-//             while (running_.load(std::memory_order_acquire)) {
-//                 while (queue_.pop(buf)) {
-//                     batch.push_back(buf);
-
-//                     if (batch.size() == BATCH_SIZE) {
-//                         flush_batch(batch);
-//                     }
-//                 }
-
-//                 if (!batch.empty()) {
-//                     flush_batch(batch);
-//                 }
-
-//                 std::this_thread::yield();
-//             }
-
-//             while (queue_.pop(buf)) {
-//                 batch.push_back(std::move(buf));
-//             }
-
-//             if (!batch.empty()) {
-//                 flush_batch(batch);
-//             }
-//         }
-
-//         void flush_batch(std::vector<LogBuffer*>& batch) {
-//             for (const auto& msg : batch) {
-//                 DWORD written = 0;
-
-//                 ::WriteFile(
-//                     file_,
-//                     msg->data(),
-//                     static_cast<DWORD>(msg->size()),
-//                     &written,
-//                     nullptr
-//                 );
-//                 delete msg;
-//                 // unrecoverable I/O errors are intentionally ignored
-//             }
-
-//             batch.clear();
-//         }
-
-//     private:
-        // SpscRingBuffer<LogBuffer*, 1 << 14> queue_;
-        // std::atomic<bool> running_;
-        // std::thread writer_;
-        // HANDLE file_{INVALID_HANDLE_VALUE};
-// };
-
-
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <optional>
-
-#pragma pack(push, 1)
-struct MessageHeader {
-    MessageType type;
-    uint16_t size;
-};
-#pragma pack(pop)
-
 template<size_t Capacity>
-class ZeroAllocRingBuffer {
+class RingBuffer {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
 
     public:
@@ -252,6 +78,25 @@ class ZeroAllocRingBuffer {
 
             tail_.store(tail + sizeof(MessageHeader) + header.size, std::memory_order_release);
             return header.size;
+        }
+
+        std::pair<const uint8_t*, size_t> peek() const noexcept {
+            const size_t tail = tail_.load(std::memory_order_relaxed);
+            const size_t head = head_.load(std::memory_order_acquire);
+
+            if (tail == head) return {nullptr, 0};
+
+            const size_t idx = tail & mask_;
+            const size_t to_end = Capacity - idx;
+            const size_t available = head - tail;
+
+            // We only return the contiguous part (up to the end of the buffer)
+            // If the data wraps around, the next peek() will return the rest.
+            return { &buffer_[idx], std::min(available, to_end) };
+        }
+
+        void advance_read_index(size_t count) noexcept {
+            tail_.fetch_add(count, std::memory_order_release);
         }
 
     private:
@@ -373,7 +218,7 @@ class BinaryEventLogger {
             ::WriteFile(file_, buffer, static_cast<DWORD>(size), &written, nullptr);
         }
 
-        ZeroAllocRingBuffer<1 << 22> queue_; 
+        RingBuffer<1 << 22> queue_; 
         std::atomic<bool> running_;
         std::thread writer_;
         HANDLE file_{INVALID_HANDLE_VALUE};
