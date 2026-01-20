@@ -169,8 +169,7 @@ class OrderManager {
             const Id_t client_id = client_request_id_++;
             connection_.send_message(
                 static_cast<Message_t>(MessageType::CANCEL_ORDER),
-                &make_cancel_order(client_id, entry.exchange_order_id),
-                SendMode::ASAP
+                &make_cancel_order(client_id, entry.exchange_order_id)
             );
 
             reschedule_next_expiry();

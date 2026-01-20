@@ -15,6 +15,8 @@
 #include <boost/endian/conversion.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/bind_executor.hpp>
+#include <boost/asio.hpp>
+#include <boost/asio/buffer.hpp>
 
 #include "connectivity.hpp"
 #include "error.hpp"
@@ -27,192 +29,159 @@ using boost::asio::ip::tcp;
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-
-// Theoretical maximum size of an (IPv4) UDP packet (actual maximum is lower).
-constexpr size_t READ_SIZE = 65535;
-
 Connection::Connection(
-    boost::asio::io_context& context, 
-    tcp::socket&& socket, 
-    Id_t id, 
-    boost::asio::strand<boost::asio::any_io_executor>* exchange_strand
+    boost::asio::io_context& context,
+    tcp::socket&& socket,
+    Id_t id,
+    boost::asio::strand<boost::asio::any_io_executor>* on_message_strand
 )
-    : context_(context),
-      in_buffer_(),
-      out_buffer_(),
-      socket_(std::move(socket)),
-      id_(id),
-      io_strand_(socket_.get_executor()),
-      on_message_strand_(exchange_strand) {
-        set_name(std::to_string(id));
-      }
+    : context_(context)
+    , socket_(std::move(socket))
+    , id_(id)
+    , read_buffer_(std::make_unique<uint8_t[]>(READ_SIZE))
+    , io_strand_(socket_.get_executor())
+    , on_message_strand_(on_message_strand)
+    {}
 
 Connection::~Connection() {
-    RLOG(LG_CON, LogLevel::LL_INFO) << std::quoted(name_, '\'') << " closing";
-    if (socket_.is_open()) {
-        socket_.close();
-    }
+    close();
 }
 
-void Connection::async_read() {
-    auto buf = in_buffer_.prepare(READ_SIZE);
-    socket_.async_read_some(
-        buf,
-        boost::asio::bind_executor(
+void Connection::close() { boost::system::error_code ec; socket_.close(ec); }
+
+bool Connection::send_raw(const uint8_t* data, size_t len) noexcept {
+    const bool pushed = send_queue_.try_push(data, len);
+    if (!pushed) {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " send queue full, dropping " << len << " bytes.";
+        return false; // drop / count / disconnect policy
+    }
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " queued " << len << " bytes for send.";
+
+    bool expected = false;
+    if (write_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        boost::asio::post(
             io_strand_,
-            [this](const boost::system::error_code& error, size_t size) {
-                read_some_handler(error, size);
-            }
-        )
+            [this]() { start_write(); }
+        );
+    }
+    return true;
+}
+
+void Connection::start_write() {
+    auto [ptr, len] = send_queue_.peek();
+    if (len == 0) {
+        write_in_progress_.store(false, std::memory_order_release);
+        return;
+    }
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " starting async_write_some of " << len << " bytes.";
+    boost::asio::const_buffer buffer(ptr, len);
+
+    socket_.async_write_some(
+        buffer,
+        [this](const boost::system::error_code& ec, size_t n) {
+            handle_write(ec, n);
+        }
     );
 }
 
-void Connection::close() {
-    boost::system::error_code ec;
-    socket_.close(ec);
-}
-
-void Connection::read_some_handler(const boost::system::error_code& error, size_t size) {
-    if (error) {
-        if (error == error::eof) {
-            RLOG(LG_CON, LogLevel::LL_INFO) << std::quoted(name_, '\'') << " remote disconnect";
-        } else if (error == error::interrupted || error == error::try_again || error == error::would_block) {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " read interrupted: " << error.message();
-            async_read();
-            return;
-        } else {
-            RLOG(LG_CON, LogLevel::LL_ERROR) << std::quoted(name_, '\'') << " read error: " << error.message();
-        }
-        on_disconnect();
-        return;
-    }
-
-    RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " received " << size << " bytes";
-    in_buffer_.commit(size);
-
-    auto bufs = in_buffer_.data();
-    auto it = boost::asio::buffers_begin(bufs);
-    auto end = boost::asio::buffers_end(bufs);
-
-    const uint8_t* begin = reinterpret_cast<const uint8_t*>(&(*it));
-    const uint8_t* upto = begin;
-
-    size_t available = in_buffer_.size();
-    
-    while (available >= MESSAGE_HEADER_SIZE) {
-        uint8_t message_type = upto[0];
-        uint16_t payload_size;
-        std::memcpy(&payload_size, &upto[1], sizeof(payload_size));
-        size_t expected_payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
-
-        if ((static_cast<size_t>(payload_size) != expected_payload_size) && (expected_payload_size > 0)) {
-            RLOG(LG_CON, LogLevel::LL_ERROR)
-                << std::quoted(name_, '\'') << " invalid payload size=" << payload_size;
+void Connection::handle_write(const boost::system::error_code& ec, size_t n) {
+    if (ec) {
+        if (ec != boost::asio::error::would_block &&
+            ec != boost::asio::error::try_again &&
+            ec != boost::asio::error::interrupted) {
+            RLOG(LG_CON, LogLevel::LL_ERROR) << id_ << " write error: " << ec.message();
             on_disconnect();
             return;
         }
-
-        if (available < payload_size + MESSAGE_HEADER_SIZE) {
-            break;
-        }
-        const uint8_t* payload_ptr = upto + MESSAGE_HEADER_SIZE;
-
-        std::vector<uint8_t> payload(payload_ptr, payload_ptr + payload_size);
-
-        boost::asio::post(*on_message_strand_,
-            [this, message_type, payload = std::move(payload)]() mutable {
-                on_message_received(message_type, payload.data());
-            }
-        );
-
-        upto += payload_size + MESSAGE_HEADER_SIZE;
-        available -= payload_size + MESSAGE_HEADER_SIZE;
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " transient write error: " << ec.message();
+        // transient error: retry
+    } else {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " wrote " << n << " bytes.";
+        send_queue_.advance_read_index(n);
     }
 
-    in_buffer_.consume(upto - begin);
+    auto [ptr, len] = send_queue_.peek();
+    if (len > 0) {
+        start_write();
+    } else {
+        write_in_progress_.store(false, std::memory_order_release);
+
+        if (send_queue_.peek().second > 0) {
+            bool expected = false;
+            if (write_in_progress_.compare_exchange_strong(expected, true)) {
+                boost::asio::dispatch(io_strand_, [this] {
+                    start_write();
+                });
+            }
+        }
+    }
+}
+
+
+void Connection::async_read() {
+    boost::asio::dispatch(io_strand_, [this]()
+    {
+        socket_.async_read_some(
+            boost::asio::buffer(read_buffer_.get(), READ_SIZE),
+            [this](const boost::system::error_code& ec, size_t n) {
+                handle_read(ec, n);
+            }
+        );
+    });
+}
+
+void Connection::handle_read(const boost::system::error_code& ec, size_t n) {
+    if (ec) {
+        RLOG(LG_CON, LogLevel::LL_ERROR) << id_ << " read error: " << ec.message();
+        on_disconnect();
+        return;
+    }
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " received " << n << " bytes.";
+    parse_messages(read_buffer_.get(), n);
     async_read();
 }
 
-void Connection::send() {
-    is_sending_ = true;
-    socket_.async_write_some(
-        out_buffer_.data(),
-        boost::asio::bind_executor(
-            io_strand_,
-            [this](const boost::system::error_code& err, size_t sz) {
-                write_some_handler(err, sz);
-            }
-        )
-    );
-}
+void Connection::parse_messages(const uint8_t* buf, size_t n) {
+    size_t offset = 0;
 
-void Connection::send(SendMode mode) {
-    if (mode == SendMode::ASAP) {
-        send();
-    } else if (!is_send_posted_) {
-        boost::asio::post(
-            io_strand_,
-            [this] {
-                is_send_posted_ = false;
-                if (!is_sending_) {
-                    send();
-                }
+    while (offset + sizeof(MessageHeader) <= n) {
+        Message_t type = static_cast<Message_t>(buf[offset]);
+        uint16_t payload_size;
+        std::memcpy(&payload_size, buf + offset + 1, sizeof(payload_size));
+
+        if (offset + sizeof(MessageHeader) + payload_size > n) {
+            break; // incomplete message, wait for more bytes
+        }
+
+        RLOG(LG_CON, LogLevel::LL_DEBUG)
+            << id_ << " parsed message type="
+            << static_cast<int>(type)
+            << " payload_size=" << payload_size;
+        const uint8_t* payload_ptr = buf + offset + sizeof(MessageHeader);
+
+        std::vector<uint8_t> payload(payload_ptr, payload_ptr + payload_size);
+        boost::asio::post(*on_message_strand_, 
+            [this, type, payload = std::move(payload)]() mutable {
+                on_message_received(type, payload.data());
             }
         );
-        is_send_posted_ = true;
+
+        offset += sizeof(MessageHeader) + payload_size;
     }
 }
 
-void Connection::send_message(Message_t message_type, const void* payload, SendMode mode) {
-    const size_t payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
-    std::vector<uint8_t> copy(
-        static_cast<const uint8_t*>(payload),
-        static_cast<const uint8_t*>(payload) + payload_size
-    );
+void Connection::send_message(Message_t type, const void* payload) noexcept {
+    uint16_t payload_size = payload_size_for_type(static_cast<MessageType>(type));
+    uint8_t buffer[sizeof(MessageHeader) + MAX_PAYLOAD_SIZE];
+    MessageHeader header{ static_cast<MessageType>(type), payload_size };
+    std::memcpy(buffer, &header, sizeof(header));
+    std::memcpy(buffer + sizeof(header), payload, payload_size);
+     RLOG(LG_CON, LogLevel::LL_DEBUG)
+        << id_ << " sending message type="
+        << static_cast<int>(type)
+        << " payload_size=" << payload_size;
 
-    boost::asio::post(
-        io_strand_,
-        [this, message_type, mode, copy = std::move(copy)]() mutable {
-            const uint16_t payload_size = static_cast<uint16_t>(copy.size());
-
-            auto buf = out_buffer_.prepare(copy.size() + MESSAGE_HEADER_SIZE);
-            auto* data = static_cast<uint8_t*>(buf.data());
-            serialize_message(data, static_cast<MessageType>(message_type), copy.data(), payload_size);
-            // data[0] = static_cast<uint8_t>(message_type);
-            // std::memcpy(data + 1, &payload_size, sizeof(payload_size));
-            // std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), payload_size);
-            out_buffer_.commit(copy.size() + MESSAGE_HEADER_SIZE);
-
-            if (!is_sending_) {
-                send(mode);
-            }
-        }
-    );
-}
-
-void Connection::write_some_handler(const boost::system::error_code& error, size_t size) {
-    if (error) {
-        if (error != error::interrupted && error != error::would_block && error != error::try_again) {
-            RLOG(LG_CON, LogLevel::LL_ERROR) << std::quoted(name_, '\'') << " send failed: " << error.message();
-            throw TGError("send failed: " + error.message());
-        }
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " send interrupted: " << error.message();
-    } else {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " sent " << size << " bytes";
-        out_buffer_.consume(size);
-    }
-
-    if (out_buffer_.size() > 0) {
-        socket_.async_write_some(
-            out_buffer_.data(),
-            boost::asio::bind_executor(
-                io_strand_,
-                [this](const boost::system::error_code& err, size_t sz) {
-                    write_some_handler(err, sz);
-                }
-            )
-        );
-    } else {
-        is_sending_ = false;
+    if (!send_raw(buffer, sizeof(header) + payload_size)) {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << id_ << " failed to enqueue message";
     }
 }

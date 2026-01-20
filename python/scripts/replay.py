@@ -92,7 +92,7 @@ def main():
     book = OrderBook()
 
 
-    with open("logs/20260119_181643.bin", "rb") as f:
+    with open("logs/20260120_123225.bin", "rb") as f:
         data = f.read()
 
     offset = 0

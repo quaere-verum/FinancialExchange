@@ -372,7 +372,7 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
         }
     }
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
-    RLOG(LG_CON, LogLevel::LL_INFO) << "[OrderBook] order_index_.size()=" << order_index_.size() << "\n";
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] order_index_.size()=" << order_index_.size() << "\n";
 
     _debug_check_level_integrity(*this);
 }
@@ -541,9 +541,6 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
     }
     side.pool_.deallocate(order);
     order_index_.erase(order_idx);
-    #ifndef NDEBUG
-    std::cout << "[OrderBook] Order removed.\n";
-    #endif
 }
 
 void OrderBook::build_snapshot(

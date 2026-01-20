@@ -33,26 +33,25 @@ class MarketSimulator {
             , state_(liquidity_bucket_bounds)
             , request_id_(0)
             , order_manager_(context, connection_, request_id_) {
-                connection_.message_received = [this](IConnection* from, Message_t type, const uint8_t* data) {
+                connection_.message_received = [this](Connection* from, Message_t type, const uint8_t* data) {
                     this->on_message(
                         static_cast<Connection*>(from),
                         type,
                         data
                     );
                 };
-                connection_.async_read();
-                populate_initial_book();
             }
 
         ~MarketSimulator() {stop();}
 
         void start() {
             running_ = true;
+            connection_.async_read();
+            populate_initial_book();
             PayloadSubscribe sub = make_subscribe(0);
             connection_.send_message(
                 static_cast<Message_t>(MessageType::SUBSCRIBE),
-                &sub,
-                SendMode::ASAP
+                &sub
             );
             schedule_next_event();
         }
@@ -81,8 +80,7 @@ class MarketSimulator {
                         best_bid_price - depth,
                         base_qty * (max_depth - depth),
                         Lifespan::GOOD_FOR_DAY
-                    ),
-                    SendMode::ASAP
+                    )
                 );
                 order_manager_.register_pending_insert(buy_request_id, 10.0);
 
@@ -95,8 +93,7 @@ class MarketSimulator {
                         best_ask_price + depth,
                         base_qty * (max_depth - depth),
                         Lifespan::GOOD_FOR_DAY
-                    ),
-                    SendMode::ASAP
+                    )
                 );
                 order_manager_.register_pending_insert(sell_request_id, 10.0);
             }
@@ -172,9 +169,6 @@ class MarketSimulator {
         void generate_insert() {
             Id_t request_id = request_id_++;
             InsertDecision insert = dynamics_.decide_insert(state_, order_manager_.cumulative_hazard(), rng_.get());
-            #ifndef NDEBUG
-            std::cout << "[MarketSimulator] generate_insert() request_id=" << request_id << "\n";
-            #endif
             PayloadInsertOrder payload = make_insert_order(
                 request_id,
                 insert.side,
@@ -185,8 +179,7 @@ class MarketSimulator {
             order_manager_.register_pending_insert(request_id, insert.cancellation_hazard_mass);
             connection_.send_message(
                 static_cast<Message_t>(MessageType::INSERT_ORDER),
-                &payload,
-                SendMode::ASAP
+                &payload
             );
         }
 
@@ -195,17 +188,18 @@ class MarketSimulator {
         boost::asio::io_context& context_;
         std::unique_ptr<RNG> rng_;
 
+        boost::asio::strand<boost::asio::any_io_executor> on_message_strand_;
+        Connection connection_;
+
         double lambda_insert_{LAMBDA_INSERT_BASE};
         double lambda_cancel_{LAMBDA_CANCEL_BASE};
 
         std::atomic<bool> running_{false};
-        std::atomic<Id_t> request_id_;
+        std::atomic<Id_t> request_id_{0};
 
         ShadowOrderBook shadow_order_book_;
         MarketDynamics<N> dynamics_;
         SimulationState<N> state_;
         OrderManager order_manager_;
 
-        boost::asio::strand<boost::asio::any_io_executor> on_message_strand_;
-        Connection connection_;
 };

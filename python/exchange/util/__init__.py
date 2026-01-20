@@ -57,6 +57,7 @@ CPP_TO_STRUCT = {
     "Time_t": "Q",
     "Seq_t": "Q",
     "Message_t": "B",
+    "MessageType": "B",
 
     # enums
     "Side": "B",

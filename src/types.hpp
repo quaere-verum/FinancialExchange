@@ -43,22 +43,22 @@ std::basic_ostream<C, T>& operator<<(std::basic_ostream<C, T>& strm, Side side) 
 
 enum class SendMode {ASAP, SOON};
 
-struct IConnection {
-    virtual ~IConnection() = default;
-    virtual void async_read() = 0;
-    virtual void send_message(Message_t message_type, const void* payload, SendMode mode) = 0;
-    void send_message(Message_t message_type, const void* payload) {send_message(message_type, payload, SendMode::ASAP);};
-    const std::string& get_name() const {return name_;};
-    void set_name(std::string name) {name_ = std::move(name);};
+// struct IConnection {
+//     virtual ~IConnection() = default;
+//     virtual void async_read() = 0;
+//     virtual void send_message(Message_t message_type, const void* payload, SendMode mode) = 0;
+//     void send_message(Message_t message_type, const void* payload) {send_message(message_type, payload, SendMode::ASAP);};
+//     const std::string& get_name() const {return name_;};
+//     void set_name(std::string name) {name_ = std::move(name);};
 
-    std::function<void(IConnection*)> disconnected;
-    std::function<void(IConnection*, Message_t, const uint8_t*)> message_received;
+//     std::function<void(IConnection*)> disconnected;
+//     std::function<void(IConnection*, Message_t, const uint8_t*)> message_received;
 
-    protected:
-        void on_disconnect() {if (disconnected) {disconnected(this);}}
-        void on_message_received(Message_t message_type, const uint8_t* data) {
-            if (message_received) {message_received(this, message_type, data);}
-        }
+//     protected:
+//         void on_disconnect() {if (disconnected) {disconnected(this);}}
+//         void on_message_received(Message_t message_type, const uint8_t* data) {
+//             if (message_received) {message_received(this, message_type, data);}
+//         }
 
-        std::string name_;
-};
+//         std::string name_;
+// };

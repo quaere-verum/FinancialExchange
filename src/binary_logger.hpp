@@ -2,6 +2,7 @@
 #include "types.hpp"
 #include "protocol.hpp"
 #include "connectivity.hpp"
+#include "ring_buffer.hpp"
 #include <cassert>
 #include <cstdlib>
 #include <windows.h>
@@ -38,97 +39,6 @@ inline std::string make_timestamped_filename(const std::string& dir) {
     return oss.str();
 }
 
-template<size_t Capacity>
-class RingBuffer {
-    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
-
-    public:
-
-        bool try_push(MessageType type, const void* payload, uint16_t payload_size) noexcept {
-            const size_t total_size = sizeof(MessageHeader) + payload_size;
-            const size_t head = head_.load(std::memory_order_relaxed);
-            const size_t tail = tail_.load(std::memory_order_acquire);
-
-            if (Capacity - (head - tail) < total_size) {
-                return false; 
-            }
-
-            MessageHeader header{ type, payload_size };
-            copy_to_buffer(head, &header, sizeof(MessageHeader));
-            
-            copy_to_buffer(head + sizeof(MessageHeader), payload, payload_size);
-
-            head_.store(head + total_size, std::memory_order_release);
-            return true;
-        }
-
-        size_t try_pop(uint8_t* dest_buffer, size_t dest_capacity, MessageType& out_type) noexcept {
-            const size_t tail = tail_.load(std::memory_order_relaxed);
-            const size_t head = head_.load(std::memory_order_acquire);
-
-            if (tail == head) return 0;
-
-            MessageHeader header;
-            copy_from_buffer(tail, &header, sizeof(MessageHeader));
-
-            if (dest_capacity < header.size) return 0; // Out of space in dest
-
-            copy_from_buffer(tail + sizeof(MessageHeader), dest_buffer, header.size);
-            out_type = header.type;
-
-            tail_.store(tail + sizeof(MessageHeader) + header.size, std::memory_order_release);
-            return header.size;
-        }
-
-        std::pair<const uint8_t*, size_t> peek() const noexcept {
-            const size_t tail = tail_.load(std::memory_order_relaxed);
-            const size_t head = head_.load(std::memory_order_acquire);
-
-            if (tail == head) return {nullptr, 0};
-
-            const size_t idx = tail & mask_;
-            const size_t to_end = Capacity - idx;
-            const size_t available = head - tail;
-
-            // We only return the contiguous part (up to the end of the buffer)
-            // If the data wraps around, the next peek() will return the rest.
-            return { &buffer_[idx], std::min(available, to_end) };
-        }
-
-        void advance_read_index(size_t count) noexcept {
-            tail_.fetch_add(count, std::memory_order_release);
-        }
-
-    private:
-        void copy_to_buffer(size_t pos, const void* src, size_t len) noexcept {
-            const size_t idx = pos & mask_;
-            const size_t to_end = Capacity - idx;
-            if (to_end < len) {
-                std::memcpy(&buffer_[idx], src, to_end);
-                std::memcpy(&buffer_[0], (const uint8_t*)src + to_end, len - to_end);
-            } else {
-                std::memcpy(&buffer_[idx], src, len);
-            }
-        }
-
-        void copy_from_buffer(size_t pos, void* dest, size_t len) noexcept {
-            const size_t idx = pos & mask_;
-            const size_t to_end = Capacity - idx;
-            if (to_end < len) {
-                std::memcpy(dest, &buffer_[idx], to_end);
-                std::memcpy((uint8_t*)dest + to_end, &buffer_[0], len - to_end);
-            } else {
-                std::memcpy(dest, &buffer_[idx], len);
-            }
-        }
-
-        static constexpr size_t mask_ = Capacity - 1;
-        alignas(64) std::atomic<size_t> head_{0};
-        alignas(64) std::atomic<size_t> tail_{0};
-        uint8_t buffer_[Capacity]; 
-};
-
-
 class BinaryEventLogger {
     public:
         explicit BinaryEventLogger(const std::string& file)
@@ -140,7 +50,7 @@ class BinaryEventLogger {
                 FILE_SHARE_READ,
                 nullptr,
                 OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                FILE_ATTRIBUTE_NORMAL,
                 nullptr
             );
 
@@ -167,51 +77,56 @@ class BinaryEventLogger {
         }
 
         void log_message(MessageType type, const void* payload) noexcept {
-            uint16_t size = payload_size_for_type(type);
+            const uint16_t payload_size = payload_size_for_type(type);
 
-            
-            if (!queue_.try_push(type, payload, size)) {
-                // TODO: Implement this
+            MessageHeader header{ type, payload_size };
+
+            uint8_t buffer[sizeof(MessageHeader) + MAX_PAYLOAD_SIZE];
+            std::memcpy(buffer, &header, sizeof(header));
+            std::memcpy(buffer + sizeof(header), payload, payload_size);
+
+            const size_t total = sizeof(header) + payload_size;
+
+            if (!queue_.try_push(buffer, total)) {
+                // drop / count / backpressure
             }
         }
+
 
     private:
         void writer_loop() {
-            uint8_t staging_buffer[65536]; // 64KB buffer
-            size_t current_offset = 0;
-            MessageType msg_type;
+            alignas(64) uint8_t staging[65536];
+            size_t offset = 0;
 
             while (running_.load(std::memory_order_acquire)) {
-                // Peek at the message size from the ring buffer...
-                // (Assuming a slightly modified try_pop that returns data directly)
-                
-                uint8_t msg_payload[MAX_PAYLOAD_SIZE];
-                size_t bytes_read = queue_.try_pop(msg_payload, sizeof(msg_payload), msg_type);
+                auto [ptr, len] = queue_.peek();
 
-                if (bytes_read > 0) {
-                    // Serialize header + payload into our staging buffer
-                    MessageHeader header{msg_type, static_cast<uint16_t>(bytes_read) };
-                    
-                    // Ensure we don't overflow staging_buffer
-                    if (current_offset + sizeof(header) + bytes_read > sizeof(staging_buffer)) {
-                        flush_to_disk(staging_buffer, current_offset);
-                        current_offset = 0;
+                if (len > 0) {
+                    const size_t to_copy = std::min(len, sizeof(staging) - offset);
+
+                    std::memcpy(staging + offset, ptr, to_copy);
+                    offset += to_copy;
+
+                    queue_.advance_read_index(to_copy);
+
+                    if (offset == sizeof(staging)) {
+                        flush_to_disk(staging, offset);
+                        offset = 0;
                     }
-
-                    std::memcpy(staging_buffer + current_offset, &header, sizeof(header));
-                    current_offset += sizeof(header);
-                    std::memcpy(staging_buffer + current_offset, msg_payload, bytes_read);
-                    current_offset += bytes_read;
                 } else {
-                    // If the queue is empty, flush whatever we have and rest
-                    if (current_offset > 0) {
-                        flush_to_disk(staging_buffer, current_offset);
-                        current_offset = 0;
+                    if (offset > 0) {
+                        flush_to_disk(staging, offset);
+                        offset = 0;
                     }
-                    _mm_pause(); 
+                    _mm_pause();
                 }
             }
+
+            if (offset > 0) {
+                flush_to_disk(staging, offset);
+            }
         }
+
 
         void flush_to_disk(const void* buffer, size_t size) {
             DWORD written = 0;
