@@ -213,6 +213,7 @@ class MarketDynamics {
             };
         }
 
+
         
         void update_intensity(
             const SimulationState<N>& state,

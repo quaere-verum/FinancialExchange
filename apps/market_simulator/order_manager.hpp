@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <atomic>
+#include <cassert>
 
 #include "types.hpp"
 #include "protocol.hpp"
@@ -12,18 +13,18 @@
 class OrderManager {
     public:
         OrderManager(
-            boost::asio::io_context& io,
+            boost::asio::strand<boost::asio::any_io_executor>& strand,
             Connection& connection,
             std::atomic<Id_t>& request_id
         )
-        : strand_(boost::asio::make_strand(io))
-        , timer_(io)
+        : strand_(strand)
+        , timer_(strand_)
         , connection_(connection)
         , client_request_id_(request_id)
         {}
 
         void register_pending_insert(Id_t client_request_id, double hazard_threshold) {
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, client_request_id, hazard_threshold] {
                     pending_inserts_[client_request_id] = hazard_threshold;
@@ -35,7 +36,7 @@ class OrderManager {
             const Id_t client_id = msg->client_request_id;
             const Id_t exchange_id = msg->exchange_order_id;
 
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, client_id, exchange_id] {
                     auto it = pending_inserts_.find(client_id);
@@ -58,7 +59,7 @@ class OrderManager {
                 return;
             }
 
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, exchange_id = msg->exchange_order_id] {
                     active_orders_.erase(exchange_id);
@@ -67,7 +68,7 @@ class OrderManager {
         }
 
         void update_cancel_rate(double lambda_cancel) {
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, lambda_cancel] {
                     advance_hazard_to_now();
@@ -78,10 +79,18 @@ class OrderManager {
         }
 
         size_t open_order_count() const {
+            #ifndef NDEBUG
+                assert(strand_.running_in_this_thread());
+            #endif
             return active_orders_.size();
         }
 
-        const double cumulative_hazard() const {return cumulative_hazard_;}
+        const double cumulative_hazard() const {
+            #ifndef NDEBUG
+                assert(strand_.running_in_this_thread());
+            #endif
+            return cumulative_hazard_;
+        }
 
     private:
         struct HazardEntry {
@@ -159,13 +168,6 @@ class OrderManager {
                 return;
             }
 
-            #ifndef NDEBUG
-                std::cout << "[OrderManager] Cancelling order "
-                        << entry.exchange_order_id
-                        << " at cumulative_hazard=" << cumulative_hazard_
-                        << "\n";
-            #endif
-
             const Id_t client_id = client_request_id_++;
             connection_.send_message(
                 static_cast<Message_t>(MessageType::CANCEL_ORDER),
@@ -176,8 +178,9 @@ class OrderManager {
         }
 
     private:
-        boost::asio::strand<boost::asio::any_io_executor> strand_;
+        boost::asio::strand<boost::asio::any_io_executor>& strand_;
         boost::asio::steady_timer timer_;
+
         Connection& connection_;
         std::atomic<Id_t>& client_request_id_;
 

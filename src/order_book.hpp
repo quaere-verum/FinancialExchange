@@ -20,8 +20,22 @@ struct OrderBookSide {
     OrderBookSide(bool is_bid);
 
     inline size_t price_to_index(Price_t price) const noexcept;
-    Volume_t match_buy(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::unordered_map<Id_t, Order*>& order_index) noexcept;
-    Volume_t match_sell(Price_t incoming_price, Volume_t incoming_quantity, Id_t order_id, Id_t client_id, std::unordered_map<Id_t, Order*>& order_index) noexcept;
+    Volume_t match_buy(
+        Price_t incoming_price, 
+        Volume_t incoming_quantity, 
+        Id_t order_id, 
+        Id_t client_id, 
+        std::vector<Order*>& order_index,
+        std::unordered_map<Id_t, Id_t>& order_id_to_handle
+    ) noexcept;
+    Volume_t match_sell(
+        Price_t incoming_price, 
+        Volume_t incoming_quantity, 
+        Id_t order_id, 
+        Id_t client_id, 
+        std::vector<Order*>& order_index,
+        std::unordered_map<Id_t, Id_t>& order_id_to_handle
+    ) noexcept;
     void print_side(const char* name) const;
     Order* add_order(Price_t price, Volume_t quantity, Volume_t quantity_remaining, Id_t id, Id_t client_id, Id_t client_request_id) noexcept;
     void update_best_bid_after_order(size_t price_idx);
@@ -42,7 +56,8 @@ struct OrderBookSide {
             Side maker_side,
             PriceCrossFn crosses,
             BestPriceFn advance_best,
-            std::unordered_map<Id_t, Order*>& order_index
+            std::vector<Order*>& order_index,
+            std::unordered_map<Id_t, Id_t>& order_id_to_handle
         ) noexcept;
         OrderBookCallbacks* callbacks_;
 };
@@ -58,7 +73,7 @@ struct OrderBook {
     void cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_id) noexcept;
     void amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept;
     void set_callbacks(OrderBookCallbacks* callbacks);
-    void remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level);
+    void remove_order(Order* order, OrderBookSide& side, PriceLevel& level);
     void build_snapshot(
         std::array<Volume_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_volumes,
         std::array<Price_t, ORDER_BOOK_MESSAGE_DEPTH>& bid_prices,
@@ -69,7 +84,8 @@ struct OrderBook {
     private:
         Id_t order_id_;
         Id_t trade_id_;
-        std::unordered_map<Id_t, Order*> order_index_;
+        std::vector<Order*> order_by_handle_;
+        std::unordered_map<Id_t, Id_t> order_id_to_handle_;
         OrderBookCallbacks* callbacks_ = nullptr;
 };
 

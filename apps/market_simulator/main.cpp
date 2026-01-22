@@ -11,11 +11,11 @@
 
 int main() {
     try {
-        size_t n_simulators = 5;
+        size_t n_simulators = 1;
 
         auto core = boost::log::core::get();
         core->set_filter(
-            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_INFO
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_DEBUG
         );
 
         const std::array<Price_t, 3> bounds = {1, 5, 10};
@@ -34,11 +34,19 @@ int main() {
                     boost::asio::connect(socket, endpoints);
                     // Each simulator gets its own RNG seed
                     auto rng = std::make_unique<PCGRNG>(static_cast<uint64_t>(i), 0);
+                    std::atomic<bool> shutdown_requested{false};
+
+                    auto on_shutdown = [&](Connection*) {
+                        if (shutdown_requested.exchange(true)) return;
+                        io_context.stop();
+                    };
+
                     MarketSimulator<3> sim(
                         io_context,
                         std::move(socket),
                         std::move(rng),
-                        bounds
+                        bounds,
+                        on_shutdown
                     );
                     sim.start();
                     io_context.run();

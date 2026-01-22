@@ -17,6 +17,8 @@
 #include "state.hpp"
 #include "shadow_order_book.hpp"
 
+constexpr size_t MESSAGES_PER_DRAIN = 2'000;
+
 template <size_t N>
 class MarketSimulator {
     public:
@@ -24,39 +26,51 @@ class MarketSimulator {
             boost::asio::io_context& context,
             tcp::socket socket,
             std::unique_ptr<RNG> rng,
-            const std::array<Price_t, N>& liquidity_bucket_bounds
+            const std::array<Price_t, N>& liquidity_bucket_bounds,
+            std::function<void(Connection*)> on_shutdown
         )
-            : context_(context)
-            , rng_(std::move(rng))
-            , on_message_strand_(context_.get_executor())
-            , connection_(context, std::move(socket), 0, &on_message_strand_)
-            , state_(liquidity_bucket_bounds)
-            , request_id_(0)
-            , order_manager_(context, connection_, request_id_) {
-                connection_.message_received = [this](Connection* from, Message_t type, const uint8_t* data) {
-                    this->on_message(
-                        static_cast<Connection*>(from),
-                        type,
-                        data
-                    );
-                };
-            }
+        : context_(context)
+        , sim_strand_(boost::asio::make_strand(context))
+        , event_timer_(context)
+        , rng_(std::move(rng))
+        , connection_(context, std::move(socket), 0, inbound_, outbound_)
+        , state_(liquidity_bucket_bounds)
+        , request_id_(0)
+        , order_manager_(sim_strand_, connection_, request_id_) {
+            connection_.large_message_received = [this](Id_t cid, Message_t type, std::shared_ptr<std::vector<uint8_t>> buf) {
+                this->on_large_message(cid, type, buf);
+            };
+            connection_.disconnected = [this, on_shutdown = std::move(on_shutdown)](Connection* c) {
+                running_.store(false, std::memory_order_release);
+                event_timer_.cancel();
+                if (on_shutdown) on_shutdown(c);
+            };
+
+            connection_.inbound_ready = [this] {
+                if (!running_.load(std::memory_order_acquire)) return;
+                schedule_inbound_drain_();
+            };
+
+        }
+
 
         ~MarketSimulator() {stop();}
 
         void start() {
-            running_ = true;
+            running_.store(true, std::memory_order_release);
             connection_.async_read();
             populate_initial_book();
-            PayloadSubscribe sub = make_subscribe(0);
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::SUBSCRIBE),
-                &sub
-            );
-            schedule_next_event();
+            boost::asio::post(sim_strand_, [this]{ schedule_next_event(); });
         }
 
-        void stop() {running_ = false;}
+        void stop() {
+            running_.store(false, std::memory_order_release);
+            boost::asio::dispatch(sim_strand_, [this] {
+                event_timer_.cancel();
+                connection_.close();
+            });
+        }
+
 
     private:
         void populate_initial_book() {
@@ -103,18 +117,18 @@ class MarketSimulator {
         void schedule_next_event() {
             const double dt = rng_->exponential(lambda_insert_);
 
-            using steady_duration = boost::asio::steady_timer::duration;
-            auto timer = std::make_shared<boost::asio::steady_timer>(
-                on_message_strand_,
-                std::chrono::duration_cast<steady_duration>(
+            event_timer_.expires_after(
+                std::chrono::duration_cast<boost::asio::steady_timer::duration>(
                     std::chrono::duration<double>(dt)
                 )
             );
 
-            timer->async_wait(
-                [this, timer, dt]
-                (const boost::system::error_code& ec) {
-                    if (!ec && running_) {
+            event_timer_.async_wait(
+                boost::asio::bind_executor(
+                    sim_strand_,
+                    [this, dt](const boost::system::error_code& ec) {
+                        if (ec || !running_.load(std::memory_order_acquire)) return;
+
                         state_.sync_with_book(shadow_order_book_, dt);
                         order_manager_.update_cancel_rate(lambda_cancel_);
                         dynamics_.update_intensity(
@@ -127,24 +141,37 @@ class MarketSimulator {
                         generate_insert();
                         schedule_next_event();
                     }
-                }
+                )
             );
         }
 
+        void drain_inbound_bounded(size_t max_msgs) {
+            InboundMessage msg{};
+            for (size_t i = 0; i < max_msgs && inbound_.try_pop(msg); ++i) {
+                on_message(msg.message_type, msg.payload.data());
+            }
+        }
 
+        void schedule_inbound_drain_() {
+            bool expected = false;
+            if (!inbound_drain_scheduled_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                return;
+            }
 
-        void on_message(
-            Connection* from,
-            Message_t message_type,
-            const uint8_t* payload
-        ) {
+            boost::asio::post(sim_strand_, [this] {
+                inbound_drain_scheduled_.store(false, std::memory_order_release);
 
-            switch (static_cast<MessageType>(message_type)) {
-                case MessageType::ORDER_BOOK_SNAPSHOT: {
-                    const PayloadOrderBookSnapshot* snapshot = reinterpret_cast<const PayloadOrderBookSnapshot*>(payload);
-                    shadow_order_book_.on_order_book_snapshot(snapshot);
-                    break;
+                drain_inbound_bounded(MESSAGES_PER_DRAIN);
+
+                if (running_.load(std::memory_order_acquire) && inbound_.size_approx() != 0) {
+                    schedule_inbound_drain_();
                 }
+            });
+        }
+
+
+        void on_message(Message_t message_type, const uint8_t* payload) {
+            switch (static_cast<MessageType>(message_type)) {
                 case MessageType::PRICE_LEVEL_UPDATE: {
                     const PayloadPriceLevelUpdate* update = reinterpret_cast<const PayloadPriceLevelUpdate*>(payload);
                     shadow_order_book_.on_price_level_update(update);
@@ -161,10 +188,29 @@ class MarketSimulator {
                 } case MessageType::PARTIAL_FILL_ORDER: {
                     const PayloadPartialFill* partial_fill = reinterpret_cast<const PayloadPartialFill*>(payload);
                     order_manager_.on_partial_fill(partial_fill);
+                    break;
                 }
                 default: return;
             }
         }
+
+        void on_large_message(Id_t /*connection_id*/, Message_t message_type, const std::shared_ptr<std::vector<uint8_t>>& buf) {
+            if (!buf) return;
+
+            switch (static_cast<MessageType>(message_type)) {
+                case MessageType::ORDER_BOOK_SNAPSHOT: {
+                    if (buf->size() != sizeof(PayloadOrderBookSnapshot)) return;
+
+                    const auto* snap = reinterpret_cast<const PayloadOrderBookSnapshot*>(buf->data());
+
+                    shadow_order_book_.on_order_book_snapshot(snap);
+                    return;
+                }
+                default:
+                    return;
+            }
+        }
+
 
         void generate_insert() {
             Id_t request_id = request_id_++;
@@ -186,20 +232,23 @@ class MarketSimulator {
 
     private:
         boost::asio::io_context& context_;
+        boost::asio::strand<boost::asio::io_context::executor_type> sim_strand_;
+        boost::asio::steady_timer event_timer_;
         std::unique_ptr<RNG> rng_;
+        InboundQueue inbound_;
+        OutboundQueue outbound_;
 
-        boost::asio::strand<boost::asio::any_io_executor> on_message_strand_;
         Connection connection_;
 
         double lambda_insert_{LAMBDA_INSERT_BASE};
         double lambda_cancel_{LAMBDA_CANCEL_BASE};
 
         std::atomic<bool> running_{false};
+        std::atomic<bool> inbound_drain_scheduled_{false};
         std::atomic<Id_t> request_id_{0};
 
         ShadowOrderBook shadow_order_book_;
         MarketDynamics<N> dynamics_;
         SimulationState<N> state_;
         OrderManager order_manager_;
-
 };
