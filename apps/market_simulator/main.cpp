@@ -15,7 +15,7 @@ int main() {
 
         auto core = boost::log::core::get();
         core->set_filter(
-            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_DEBUG
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_ERROR
         );
 
         const std::array<Price_t, 3> bounds = {1, 5, 10};

@@ -13,7 +13,7 @@ Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
     , accept_strand_(context_.get_executor())
     , engine_strand_(context_.get_executor())
     , acceptor_(context_, tcp::endpoint(tcp::v4(), port))
-  // , event_logger_(make_timestamped_filename("logs")) 
+    , event_logger_("logs") 
     {
         order_book_.set_callbacks(this);
         conn_by_id_ = std::make_unique<std::atomic<Connection*>[]>(MAX_CONNECTIONS);
@@ -29,7 +29,6 @@ Exchange::~Exchange() {
 
 void Exchange::start() {
     running_.store(true, std::memory_order_release);
-    engine_thread_ = std::thread([this] { run_engine_(); });
     boost::asio::dispatch(accept_strand_, [this] { do_accept_(); });
 }
 
@@ -46,16 +45,33 @@ void Exchange::stop() {
     }
     });
 
-    if (was_running && engine_thread_.joinable()) {
-        engine_thread_.join();
-    }
-
     for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
         conn_by_id_[i].store(nullptr, std::memory_order_relaxed);
     }
     clients_.clear();
     market_data_subscribers_.clear();
 }
+
+void Exchange::schedule_engine_drain() {
+    bool expected = false;
+    if (!engine_drain_scheduled_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+
+    boost::asio::post(engine_strand_, [this] {
+        engine_drain_scheduled_.store(false, std::memory_order_release);
+
+        InboundMessage msg{};
+        std::size_t budget = 10000; // tune
+        while (budget-- && inbox_.try_pop(msg)) {
+            dispatch_(msg);
+        }
+
+        if (running_.load(std::memory_order_acquire) && inbox_.size_approx() != 0) {
+            schedule_engine_drain();
+        }
+    });
+}
+
 
 void Exchange::do_accept_() {
   acceptor_.async_accept(
@@ -89,7 +105,13 @@ void Exchange::on_accepted_(boost::system::error_code ec, tcp::socket socket) {
         m.connection_id = c->id();
         m.message_type = static_cast<Message_t>(MessageType::DISCONNECT);
         m.payload_size = 0;
-        (void)inbox_.try_push(m); // best-effort; if full, engine is overloaded anyway
+        if (inbox_.try_push(m)) {
+            schedule_engine_drain();
+        }
+    };
+    ptr->inbound_ready = [this] {
+        if (!running_.load(std::memory_order_acquire)) return;
+        schedule_engine_drain();
     };
 
     ptr->async_read();
@@ -106,19 +128,6 @@ void Exchange::publish_connection_(Id_t id, ClientState&& state) {
     Connection* ptr = state.conn.get();
     clients_.emplace(id, std::move(state));
     conn_by_id_[id].store(ptr, std::memory_order_release);
-}
-
-void Exchange::run_engine_() {
-    InboundMessage msg{};
-    while (running_.load(std::memory_order_acquire)) {
-        bool did_work = false;
-        while (inbox_.try_pop(msg)) {
-            did_work = true;
-            dispatch_(msg);
-        }
-        // Simple backoff; refine later (spin/yield/sleep hybrid)
-        if (!did_work) { std::this_thread::sleep_for(std::chrono::microseconds(50)); }
-    }
 }
 
 void Exchange::dispatch_(const InboundMessage& msg) {
@@ -277,7 +286,7 @@ void Exchange::on_trade(
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::TRADE_EVENT), &trade_message);
-    // event_logger_.log_message(MessageType::TRADE_EVENT, &trade_message);
+    event_logger_.log_message(MessageType::TRADE_EVENT, &trade_message);
 }
 
 void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -305,7 +314,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT), &insert_message);
-    // event_logger_.log_message(MessageType::ORDER_INSERTED_EVENT, &insert_message);
+    event_logger_.log_message(MessageType::ORDER_INSERTED_EVENT, &insert_message);
 }
 
 void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -330,7 +339,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_CANCELLED_EVENT), &cancel_message);
-    // event_logger_.log_message(MessageType::ORDER_CANCELLED_EVENT, &cancel_message);
+    event_logger_.log_message(MessageType::ORDER_CANCELLED_EVENT, &cancel_message);
 }
 
 void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, const Order& order, Time_t timestamp) {
@@ -356,7 +365,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_AMENDED_EVENT), &amended_message);
-    // event_logger_.log_message(MessageType::ORDER_AMENDED_EVENT, &amended_message);
+    event_logger_.log_message(MessageType::ORDER_AMENDED_EVENT, &amended_message);
 }
 
 void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timestamp) {
@@ -371,7 +380,7 @@ void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timest
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::PRICE_LEVEL_UPDATE), &message);
-    // event_logger_.log_message(MessageType::PRICE_LEVEL_UPDATE, &message);
+    event_logger_.log_message(MessageType::PRICE_LEVEL_UPDATE, &message);
 }
 
 void Exchange::on_error(Id_t client_id, Id_t client_request_id, uint16_t code, std::string_view message, Time_t timestamp) {

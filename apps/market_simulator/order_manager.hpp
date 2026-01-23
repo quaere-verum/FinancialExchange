@@ -13,7 +13,7 @@
 class OrderManager {
     public:
         OrderManager(
-            boost::asio::strand<boost::asio::any_io_executor>& strand,
+            boost::asio::strand<boost::asio::io_context::executor_type>& strand,
             Connection& connection,
             std::atomic<Id_t>& request_id
         )
@@ -118,67 +118,95 @@ class OrderManager {
         void reschedule_next_expiry() {
             timer_.cancel();
 
-            if (expiry_queue_.empty() || lambda_cancel_ <= 0.0) {
-                return;
-            }
+            advance_hazard_to_now();
+
+            if (lambda_cancel_ <= 0.0) return;
+
+            prune_top_();
+            if (expiry_queue_.empty()) return;
 
             const auto& next = expiry_queue_.top();
+            const double remaining_hazard = next.hazard_threshold - cumulative_hazard_;
 
-            double remaining_hazard = next.hazard_threshold - cumulative_hazard_;
-
+            // If due (or past due), process immediately in the strand to avoid recursion.
             if (remaining_hazard <= 0.0) {
                 boost::asio::post(
                     strand_,
-                    [this] {
-                        fire_next_expiry(boost::system::error_code{});
-                    }
+                    [this] { fire_next_expiry(boost::system::error_code{}); }
                 );
                 return;
             }
 
-
-            double dt = remaining_hazard / lambda_cancel_;
-
-            timer_.expires_after(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(dt)));
+            const double dt = remaining_hazard / lambda_cancel_;
+            timer_.expires_after(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(dt)
+                )
+            );
 
             timer_.async_wait(
                 boost::asio::bind_executor(
                     strand_,
-                    [this](const boost::system::error_code& ec) {
-                        fire_next_expiry(ec);
-                    }
+                    [this](const boost::system::error_code& ec) { fire_next_expiry(ec); }
                 )
             );
         }
 
         void fire_next_expiry(const boost::system::error_code& ec) {
-            if (ec == boost::asio::error::operation_aborted)
-                return;
+            if (ec == boost::asio::error::operation_aborted) return;
 
             advance_hazard_to_now();
 
-            if (expiry_queue_.empty())
-                return;
-
-            auto entry = expiry_queue_.top();
-            expiry_queue_.pop();
-
-            if (!active_orders_.erase(entry.exchange_order_id)) {
-                reschedule_next_expiry();
+            if (lambda_cancel_ <= 0.0) {
                 return;
             }
 
-            const Id_t client_id = client_request_id_++;
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::CANCEL_ORDER),
-                &make_cancel_order(client_id, entry.exchange_order_id)
-            );
+            prune_top_();
 
+            while (!expiry_queue_.empty()) {
+                const auto& top = expiry_queue_.top();
+                if (top.hazard_threshold > cumulative_hazard_) {
+                    break; // next not due yet
+                }
+
+                auto entry = top;
+                expiry_queue_.pop();
+                if (!active_orders_.erase(entry.exchange_order_id)) {
+                    prune_top_();
+                    continue;
+                }
+
+                const Id_t client_id = client_request_id_++;
+                connection_.send_message(
+                    static_cast<Message_t>(MessageType::CANCEL_ORDER),
+                    &make_cancel_order(client_id, entry.exchange_order_id)
+                );
+
+                prune_top_();
+            }
+            
             reschedule_next_expiry();
         }
 
+
+        void prune_top_() {
+            while (!expiry_queue_.empty()) {
+                const auto& top = expiry_queue_.top();
+                if (active_orders_.find(top.exchange_order_id) != active_orders_.end()) {
+                    break; // top is live
+                }
+                expiry_queue_.pop(); // dead entry
+            }
+        }
+
+        bool top_is_due_() const {
+            if (expiry_queue_.empty()) return false;
+            return expiry_queue_.top().hazard_threshold <= cumulative_hazard_;
+        }
+
+
     private:
-        boost::asio::strand<boost::asio::any_io_executor>& strand_;
+        boost::asio::strand<boost::asio::io_context::executor_type>& strand_;
         boost::asio::steady_timer timer_;
 
         Connection& connection_;

@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <mutex>
 
 #include <boost/asio.hpp>
 
@@ -36,6 +37,7 @@ class MarketSimulator {
         , connection_(context, std::move(socket), 0, inbound_, outbound_)
         , state_(liquidity_bucket_bounds)
         , request_id_(0)
+        // , metrics_timer_(context)
         , order_manager_(sim_strand_, connection_, request_id_) {
             connection_.large_message_received = [this](Id_t cid, Message_t type, std::shared_ptr<std::vector<uint8_t>> buf) {
                 this->on_large_message(cid, type, buf);
@@ -58,9 +60,12 @@ class MarketSimulator {
 
         void start() {
             running_.store(true, std::memory_order_release);
+            // start_metrics_();
             connection_.async_read();
-            populate_initial_book();
-            boost::asio::post(sim_strand_, [this]{ schedule_next_event(); });
+            boost::asio::post(sim_strand_, [this]{
+                last_tick_ = std::chrono::steady_clock::now();
+                schedule_tick(); 
+            });
         }
 
         void stop() {
@@ -73,83 +78,86 @@ class MarketSimulator {
 
 
     private:
-        void populate_initial_book() {
-            Price_t initial_mid_price = 1'000;
-            Price_t initial_spread = 4;
+        // void start_metrics_() {
+        //     metrics_timer_.expires_after(std::chrono::seconds(1));
+        //     metrics_timer_.async_wait(boost::asio::bind_executor(
+        //         sim_strand_,
+        //         [this](const boost::system::error_code& ec) {
+        //             if (ec || !running_.load(std::memory_order_acquire)) return;
 
-            Price_t best_bid_price = initial_mid_price - initial_spread / 2;
-            Price_t best_ask_price = initial_mid_price + initial_spread / 2;
+        //             const double avg_us =
+        //                 (tick_count_ == 0) ? 0.0 : (handler_ns_accum_ / 1000.0) / static_cast<double>(tick_count_);
 
-            Volume_t base_qty = 20;
+        //             static std::mutex cout_mtx;
+        //             std::lock_guard<std::mutex> lk(cout_mtx);
+        //             std::cout
+        //                 << "[SIM] ticks/s=" << tick_count_
+        //                 << " avg_handler_us=" << avg_us
+        //                 << " inserts_sent/s=" << inserts_sent_
+        //                 << " inbound_processed/s=" << inbound_msgs_processed_
+        //                 << " inbound_backlog_max=" << inbound_backlog_max_
+        //                 << "\n";
 
-            size_t max_depth = 5;
-            for (size_t depth = 0; depth < max_depth; depth++) {
+        //             // reset per-second counters
+        //             tick_count_ = 0;
+        //             handler_ns_accum_ = 0;
+        //             inserts_sent_ = 0;
+        //             inbound_msgs_processed_ = 0;
+        //             inbound_backlog_max_ = 0;
 
-                Id_t buy_request_id = request_id_++;
-                connection_.send_message(
-                    static_cast<Message_t>(MessageType::INSERT_ORDER),
-                    &make_insert_order(
-                        buy_request_id,
-                        Side::BUY,
-                        best_bid_price - depth,
-                        base_qty * (max_depth - depth),
-                        Lifespan::GOOD_FOR_DAY
-                    )
-                );
-                order_manager_.register_pending_insert(buy_request_id, 10.0);
+        //             start_metrics_();
+        //         }
+        //     ));
+        // }
 
-                Id_t sell_request_id = request_id_++;
-                connection_.send_message(
-                    static_cast<Message_t>(MessageType::INSERT_ORDER),
-                    &make_insert_order(
-                        sell_request_id,
-                        Side::SELL,
-                        best_ask_price + depth,
-                        base_qty * (max_depth - depth),
-                        Lifespan::GOOD_FOR_DAY
-                    )
-                );
-                order_manager_.register_pending_insert(sell_request_id, 10.0);
-            }
+        void schedule_tick() {
+            event_timer_.expires_after(std::chrono::duration_cast<boost::asio::steady_timer::duration>(tick_));
+            event_timer_.async_wait(boost::asio::bind_executor(
+                sim_strand_,
+                [this](const boost::system::error_code& ec) {
+                    if (ec || !running_.load(std::memory_order_acquire)) return;
 
-        }
-        
-        void schedule_next_event() {
-            const double dt = rng_->exponential(lambda_insert_);
-
-            event_timer_.expires_after(
-                std::chrono::duration_cast<boost::asio::steady_timer::duration>(
-                    std::chrono::duration<double>(dt)
-                )
-            );
-
-            event_timer_.async_wait(
-                boost::asio::bind_executor(
-                    sim_strand_,
-                    [this, dt](const boost::system::error_code& ec) {
-                        if (ec || !running_.load(std::memory_order_acquire)) return;
-
-                        state_.sync_with_book(shadow_order_book_, dt);
-                        order_manager_.update_cancel_rate(lambda_cancel_);
-                        dynamics_.update_intensity(
-                            state_,
-                            order_manager_.open_order_count(),
-                            lambda_insert_,
-                            lambda_cancel_
-                        );
-
-                        generate_insert();
-                        schedule_next_event();
+                    if (inbound_.size_approx() != 0) {
+                        drain_inbound_bounded(MESSAGES_PER_DRAIN);
                     }
-                )
-            );
+                    
+                    const auto t0 = std::chrono::steady_clock::now();
+                    double dt = std::chrono::duration<double>(t0 - last_tick_).count();
+                    if (dt < 0.0) dt = 0.0;
+                    if (dt > 0.25) dt = 0.25;
+                    last_tick_ = t0;
+                    state_.sync_with_book(shadow_order_book_, dt);
+                    order_manager_.update_cancel_rate(lambda_cancel_);
+                    dynamics_.update_intensity(state_, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
+
+                    const double mean = lambda_insert_ * dt;
+                    const std::uint32_t k = rng_->poisson(mean);
+
+                    for (std::uint32_t i = 0; i < k; ++i) {
+                        generate_insert();
+                    }
+
+                    // const auto t1 = std::chrono::steady_clock::now();
+                    // handler_ns_accum_ += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    // tick_count_ += 1;
+
+                    schedule_tick();
+                }
+            ));
         }
+
 
         void drain_inbound_bounded(size_t max_msgs) {
             InboundMessage msg{};
+            std::size_t n = 0;
             for (size_t i = 0; i < max_msgs && inbound_.try_pop(msg); ++i) {
                 on_message(msg.message_type, msg.payload.data());
+                ++n;
             }
+            // inbound_msgs_processed_ += n;
+
+            // const auto backlog = inbound_.size_approx();
+            // if (backlog > inbound_backlog_max_) inbound_backlog_max_ = backlog;
         }
 
         void schedule_inbound_drain_() {
@@ -227,6 +235,7 @@ class MarketSimulator {
                 static_cast<Message_t>(MessageType::INSERT_ORDER),
                 &payload
             );
+            // inserts_sent_ += 1;
         }
 
 
@@ -234,6 +243,9 @@ class MarketSimulator {
         boost::asio::io_context& context_;
         boost::asio::strand<boost::asio::io_context::executor_type> sim_strand_;
         boost::asio::steady_timer event_timer_;
+        std::chrono::duration<double> tick_{0.001};
+        std::chrono::steady_clock::time_point last_tick_{};
+
         std::unique_ptr<RNG> rng_;
         InboundQueue inbound_;
         OutboundQueue outbound_;
@@ -251,4 +263,12 @@ class MarketSimulator {
         MarketDynamics<N> dynamics_;
         SimulationState<N> state_;
         OrderManager order_manager_;
+
+        // // metrics
+        // boost::asio::steady_timer metrics_timer_;
+        // std::uint64_t tick_count_{0};
+        // std::uint64_t handler_ns_accum_{0};
+        // std::uint64_t inserts_sent_{0};
+        // std::uint64_t inbound_msgs_processed_{0};
+        // std::uint64_t inbound_backlog_max_{0};
 };
