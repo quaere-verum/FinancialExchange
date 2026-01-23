@@ -2,6 +2,10 @@
 #include "shadow_order_book.hpp"
 #include "pcg32.hpp"
 
+enum class LatentModel {GBM, OU};
+
+inline constexpr LatentModel latent_model = LatentModel::GBM;
+
 struct TimeState {
     double sim_time;
     double time_since_event;
@@ -240,25 +244,35 @@ class SimulationState {
         }
         
         inline void update_latent_state(double dt) {
-            constexpr double mu_log = 6.907755278982137; // precomputed log(1000.0)
-            constexpr double kappa  = 0.05;   // per second
-            constexpr double sigma  = 0.01;  // per sqrt second
-            constexpr double latent_update_interval = 0.1; // seconds
+            constexpr double sigma  = 0.01;
+            constexpr double latent_update_interval = 0.01;
 
             latent_state_.time_since_update += dt;
 
             if (latent_state_.time_since_update >= latent_update_interval) {
-                double latent_dt = latent_state_.time_since_update;
-                double z = rng_.standard_normal();
+                const double latent_dt = latent_state_.time_since_update;
+                const double z = rng_.standard_normal();
 
-                latent_state_.log_fair_value +=
-                    kappa * (mu_log - latent_state_.log_fair_value) * latent_dt
-                    + sigma * std::sqrt(latent_dt) * z;
+                if constexpr (latent_model == LatentModel::OU) {
+                    constexpr double kappa  = 0.05;
+                    constexpr double mu_log = 6.907755278982137; // log(1000)
+
+                    latent_state_.log_fair_value +=
+                        kappa * (mu_log - latent_state_.log_fair_value) * latent_dt
+                        + sigma * std::sqrt(latent_dt) * z;
+
+                } else {
+                    constexpr double mu = 0.0;
+                    latent_state_.log_fair_value +=
+                        (mu - 0.5 * sigma * sigma) * latent_dt
+                        + sigma * std::sqrt(latent_dt) * z;
+                }
 
                 latent_state_.fair_value = std::exp(latent_state_.log_fair_value);
                 latent_state_.time_since_update = 0.0;
             }
         }
+
 
 
 

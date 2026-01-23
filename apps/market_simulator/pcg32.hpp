@@ -45,7 +45,6 @@ class pcg32 {
 		}
 
         inline double uniform() {
-            // Convert to (0,1) with 32-bit precision
             return (next_uint() + 0.5) * inv_uint32_;
         }
 

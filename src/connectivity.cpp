@@ -30,9 +30,9 @@ void Connection::close() {
     boost::system::error_code ec;
     socket_.close(ec);
     if (ec) {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " socket.close error: " << ec.message() << '\n';
+        RLOG(LG_CON, LogLevel::LL_ERROR) << "conn=" << id_ << " socket.close error: " << ec.message() << '\n';
     } else {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " socket closed\n";
+        RLOG(LG_CON, LogLevel::LL_INFO) << "conn=" << id_ << " socket closed\n";
     }
 }
 
@@ -42,7 +42,7 @@ void Connection::notify_disconnect_once_(const boost::system::error_code& ec) {
         return;
     }
 
-    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " disconnect notified: " << ec.message() << '\n';
+    RLOG(LG_CON, LogLevel::LL_INFO) << "conn=" << id_ << " disconnect notified: " << ec.message() << '\n';
 
     close();
 
@@ -85,7 +85,7 @@ void Connection::start_read_() {
 
 void Connection::handle_read_(const boost::system::error_code& ec, size_t n) {
     if (ec) {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " read error/disconnect: "
+        RLOG(LG_CON, LogLevel::LL_ERROR) << "conn=" << id_ << " read error/disconnect: "
                << ec.message() << " (bytes_read=" << n << ")\n";
         notify_disconnect_once_(ec);
         return;
@@ -125,7 +125,7 @@ void Connection::parse_accumulator_() {
         }
 
         if (payload_size > MAX_PAYLOAD_SIZE) {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+            RLOG(LG_CON, LogLevel::LL_WARNING) << "conn=" << id_
                    << " protocol violation: payload_size=" << payload_size
                    << " > MAX_PAYLOAD_SIZE=" << MAX_PAYLOAD_SIZE
                    << " (type_u8=" << static_cast<unsigned>(type_u8)
@@ -148,7 +148,7 @@ void Connection::parse_accumulator_() {
 
             if (!inbound_to_engine_.try_push(msg)) {
                 // Backpressure policy: disconnect on sustained overload.
-                RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                RLOG(LG_CON, LogLevel::LL_WARNING) << "conn=" << id_
                        << " inbound queue backpressure: try_push failed "
                        << "(type_u8=" << static_cast<unsigned>(type_u8)
                        << " payload_size=" << payload_size
@@ -209,7 +209,7 @@ void Connection::send_message(Message_t type, const void* payload) noexcept {
     }
 
     if (!outbound_from_engine_.try_push(msg)) {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+        RLOG(LG_CON, LogLevel::LL_WARNING) << "conn=" << id_
                << " outbound queue backpressure: try_push failed "
                << "(type=" << static_cast<unsigned>(type)
                << " payload_size=" << payload_size << ")\n";
@@ -259,7 +259,7 @@ void Connection::send_message_unbuffered(Message_t type, const void* payload, ui
             io_strand_,
             [this, buffer](const boost::system::error_code& ec, size_t /*n*/) {
                 if (ec) {
-                    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                    RLOG(LG_CON, LogLevel::LL_ERROR) << "conn=" << id_
                                << " unbuffered write error/disconnect: "
                                << ec.message() << "\n";
                     notify_disconnect_once_(ec);
@@ -341,7 +341,7 @@ void Connection::start_write_() {
 void Connection::handle_write_(const boost::system::error_code& ec, size_t n) {
     if (ec) {
         write_in_progress_ = false;
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+        RLOG(LG_CON, LogLevel::LL_ERROR) << "conn=" << id_
                << " write error/disconnect: " << ec.message()
                << " (bytes_written=" << n
                << " batch_sent=" << out_batch_sent_

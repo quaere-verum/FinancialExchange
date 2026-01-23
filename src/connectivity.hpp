@@ -47,8 +47,8 @@ struct OutboundMessage {
 static_assert(std::is_trivially_copyable_v<InboundMessage>);
 static_assert(std::is_trivially_copyable_v<OutboundMessage>);
 
-constexpr size_t INBOUND_Q_CAP  = 4096;
-constexpr size_t OUTBOUND_Q_CAP = 4096;
+constexpr size_t INBOUND_Q_CAP  = 16384;
+constexpr size_t OUTBOUND_Q_CAP = 65536;
 
 using InboundQueue  = SPSCQueue<InboundMessage, INBOUND_Q_CAP>;
 using OutboundQueue = SPSCQueue<OutboundMessage, OUTBOUND_Q_CAP>;

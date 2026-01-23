@@ -19,6 +19,8 @@
 #include "shadow_order_book.hpp"
 
 constexpr size_t MESSAGES_PER_DRAIN = 2'000;
+constexpr size_t HIGH_OUTBOUND_Q_SIZE = (OUTBOUND_Q_CAP * 85) / 100;
+constexpr size_t LOW_OUTBOUND_Q_SIZE  = (OUTBOUND_Q_CAP * 70) / 100;
 
 template <size_t N>
 class MarketSimulator {
@@ -34,7 +36,9 @@ class MarketSimulator {
         , sim_strand_(boost::asio::make_strand(context))
         , event_timer_(context)
         , rng_(std::move(rng))
-        , connection_(context, std::move(socket), 0, inbound_, outbound_)
+        , inbound_(std::make_unique<InboundQueue>())
+        , outbound_(std::make_unique<OutboundQueue>())
+        , connection_(context, std::move(socket), 0, *inbound_, *outbound_)
         , state_(liquidity_bucket_bounds)
         , request_id_(0)
         // , metrics_timer_(context)
@@ -117,7 +121,7 @@ class MarketSimulator {
                 [this](const boost::system::error_code& ec) {
                     if (ec || !running_.load(std::memory_order_acquire)) return;
 
-                    if (inbound_.size_approx() != 0) {
+                    if (inbound_->size_approx() != 0) {
                         drain_inbound_bounded(MESSAGES_PER_DRAIN);
                     }
                     
@@ -129,6 +133,20 @@ class MarketSimulator {
                     state_.sync_with_book(shadow_order_book_, dt);
                     order_manager_.update_cancel_rate(lambda_cancel_);
                     dynamics_.update_intensity(state_, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
+
+                    const auto out_depth = outbound_->size_approx();
+                    if (!outbound_paused_ && out_depth >= HIGH_OUTBOUND_Q_SIZE) {
+                        outbound_paused_ = true;
+                    }
+
+                    if (outbound_paused_) {
+                        if (out_depth <= LOW_OUTBOUND_Q_SIZE) {
+                            outbound_paused_ = false;
+                        } else {
+                            schedule_tick();
+                            return;
+                        }
+                    }
 
                     const double mean = lambda_insert_ * dt;
                     const std::uint32_t k = rng_->poisson(mean);
@@ -150,7 +168,7 @@ class MarketSimulator {
         void drain_inbound_bounded(size_t max_msgs) {
             InboundMessage msg{};
             std::size_t n = 0;
-            for (size_t i = 0; i < max_msgs && inbound_.try_pop(msg); ++i) {
+            for (size_t i = 0; i < max_msgs && inbound_->try_pop(msg); ++i) {
                 on_message(msg.message_type, msg.payload.data());
                 ++n;
             }
@@ -171,7 +189,7 @@ class MarketSimulator {
 
                 drain_inbound_bounded(MESSAGES_PER_DRAIN);
 
-                if (running_.load(std::memory_order_acquire) && inbound_.size_approx() != 0) {
+                if (running_.load(std::memory_order_acquire) && inbound_->size_approx() != 0) {
                     schedule_inbound_drain_();
                 }
             });
@@ -247,8 +265,8 @@ class MarketSimulator {
         std::chrono::steady_clock::time_point last_tick_{};
 
         std::unique_ptr<RNG> rng_;
-        InboundQueue inbound_;
-        OutboundQueue outbound_;
+        std::unique_ptr<InboundQueue> inbound_;
+        std::unique_ptr<OutboundQueue> outbound_;
 
         Connection connection_;
 
@@ -258,6 +276,7 @@ class MarketSimulator {
         std::atomic<bool> running_{false};
         std::atomic<bool> inbound_drain_scheduled_{false};
         std::atomic<Id_t> request_id_{0};
+        bool outbound_paused_{false};
 
         ShadowOrderBook shadow_order_book_;
         MarketDynamics<N> dynamics_;

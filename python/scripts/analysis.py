@@ -13,8 +13,8 @@ import heapq
 # User config
 # -----------------------------
 LOG_DIR = Path("logs")
-RUN_PREFIX = "20260123_185630"  # timestamp prefix used in filenames
-MAX_SPREAD_TICKS = 50
+RUN_PREFIX = "20260123_220457"  # timestamp prefix used in filenames
+MAX_SPREAD_TICKS = 30
 
 TAU_VOL_SHORT = 1.0
 TAU_FLOW = 2.0
@@ -66,7 +66,7 @@ def struct_to_numpy_dtype(schema: PayloadSchema) -> np.dtype:
     elif endian in (">", "!"):
         np_end = ">"
     else:
-        np_end = "=" 
+        np_end = "="
 
     code_map = {
         "B": "u1", "b": "i1",
@@ -179,7 +179,10 @@ def main():
     n = len(plu)
     spreads = np.empty(n, dtype=np.int16)
     spreads.fill(-1)
-    
+
+    # NEW: track midprice; NaN when invalid
+    midprices = np.full(n, np.nan, dtype=np.float64)
+
     vol_ewma = np.zeros(n, dtype=np.float64)
     abs_imb_at_plu = np.zeros(n, dtype=np.float64)
 
@@ -221,14 +224,16 @@ def main():
 
         bb = book.best_bid()
         ba = book.best_ask()
+
         if bb is None or ba is None or ba < bb:
             spreads[i] = -1
+            midprices[i] = np.nan
         else:
             spreads[i] = int(ba - bb)
-
-        # Mid/vol EWMA
-        if bb is not None and ba is not None and ba >= bb:
             mid = 0.5 * (bb + ba)
+            midprices[i] = mid
+
+            # Mid/vol EWMA
             if last_mid is None:
                 last_mid = mid
                 last_mid_ts = ts
@@ -240,6 +245,7 @@ def main():
                 v = (1.0 - a) * v + a * (r * r)
                 last_mid = mid
                 last_mid_ts = ts
+
         vol_ewma[i] = v
 
         # Flow EWMA sampled up to this PLU timestamp
@@ -320,6 +326,24 @@ def main():
     plot_counts("Spread histogram - ALL", counts_all, over_all)
     plot_counts("Spread histogram - TOP DECILE VOL", counts_vol, over_vol)
     plot_counts("Spread histogram - TOP DECILE |IMB|", counts_imb, over_imb)
+
+    # NEW: Midprice + Spread time-series in 2-row subplot
+    if n > 0:
+        t0 = float(plu_ts[0])
+        x = (plu_ts.astype(np.float64) - t0) * 1e-9  # seconds since first PLU
+
+        fig, (ax0, ax1) = plt.subplots(nrows=2, sharex=True)
+        ax0.plot(x, midprices, linewidth=1.0)
+        ax0.set_ylabel("Midprice")
+        ax0.grid(True)
+
+        spread_plot = np.where(valid, spreads.astype(np.float64), np.nan)
+        ax1.plot(x, spread_plot, linewidth=1.0)
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Spread (ticks)")
+        ax1.grid(True)
+
+        fig.suptitle("Midprice and Spread vs Time")
 
     plt.show()
 
