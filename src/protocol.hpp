@@ -23,7 +23,6 @@ enum class MessageType : Message_t {
     ERROR_MSG = 17,
 
     ORDER_BOOK_SNAPSHOT = 21,
-    TRADE_TICKS = 22,
     TRADE_EVENT = 23,
     ORDER_INSERTED_EVENT = 24,
     ORDER_CANCELLED_EVENT = 25,
@@ -139,17 +138,6 @@ struct PayloadOrderBookSnapshot {
     Id_t sequence_number;
 };
 
-struct PayloadTradeTicks {
-    std::array<Id_t, MAX_TRADES_PER_TICK> trade_id;
-    std::array<Price_t, MAX_TRADES_PER_TICK> price;
-    std::array<Volume_t, MAX_TRADES_PER_TICK> quantity;
-    std::array<Side, MAX_TRADES_PER_TICK> taker_side;
-    std::array<Time_t, MAX_TRADES_PER_TICK> timestamp;
-
-    uint16_t tick_count;
-    Id_t sequence_number;
-};
-
 struct PayloadTradeEvent {
     Id_t sequence_number;
     Id_t trade_id;
@@ -210,7 +198,31 @@ constexpr size_t MAX_PAYLOAD_SIZE = []() {
         sizeof(PayloadPartialFill),
         sizeof(PayloadOrderStatus),
         sizeof(PayloadOrderBookSnapshot),
-        sizeof(PayloadTradeTicks),
+        sizeof(PayloadTradeEvent),
+        sizeof(PayloadOrderInsertedEvent),
+        sizeof(PayloadOrderCancelledEvent),
+        sizeof(PayloadOrderAmendedEvent),
+        sizeof(PayloadPriceLevelUpdate)
+    };
+    size_t m = 0;
+    for (size_t s : sizes) if (s > m) m = s;
+    return m;
+}();
+
+// Excludes PayloadOrderBookSnapshot because it's a large struct which won't enter the SPSC (or MPSC) queue
+constexpr size_t MAX_PAYLOAD_SIZE_BUFFER = []() {
+    size_t sizes[] = {
+        sizeof(PayloadDisconnect),
+        sizeof(PayloadInsertOrder),
+        sizeof(PayloadCancelOrder),
+        sizeof(PayloadAmendOrder),
+        sizeof(PayloadSubscribe),
+        sizeof(PayloadUnsubscribe),
+        sizeof(PayloadError),
+        sizeof(PayloadConfirmOrderInserted),
+        sizeof(PayloadConfirmOrderCancelled),
+        sizeof(PayloadConfirmOrderAmended),
+        sizeof(PayloadPartialFill),
         sizeof(PayloadTradeEvent),
         sizeof(PayloadOrderInsertedEvent),
         sizeof(PayloadOrderCancelledEvent),
@@ -240,7 +252,6 @@ inline size_t payload_size_for_type(MessageType t) {
         case MessageType::ORDER_STATUS: return sizeof(PayloadOrderStatus);
 
         case MessageType::ORDER_BOOK_SNAPSHOT: return sizeof(PayloadOrderBookSnapshot);
-        case MessageType::TRADE_TICKS: return sizeof(PayloadTradeTicks);
         case MessageType::TRADE_EVENT: return sizeof(PayloadTradeEvent);
         case MessageType::ORDER_INSERTED_EVENT: return sizeof(PayloadOrderInsertedEvent);
         case MessageType::ORDER_CANCELLED_EVENT: return sizeof(PayloadOrderCancelledEvent);
@@ -330,10 +341,6 @@ inline bool parse_message_full(const uint8_t* buf, size_t len, MessageType& out_
 
         case MessageType::ORDER_BOOK_SNAPSHOT:
             out_struct = reinterpret_cast<const PayloadOrderBookSnapshot*>(payload_ptr);
-            return true;
-
-        case MessageType::TRADE_TICKS:
-            out_struct = reinterpret_cast<const PayloadTradeTicks*>(payload_ptr);
             return true;
 
         case MessageType::TRADE_EVENT:
@@ -553,26 +560,6 @@ inline PayloadOrderBookSnapshot make_order_book_snapshot(
     p.ask_volumes = ask_volumes;
     p.bid_prices = bid_prices;
     p.bid_volumes = bid_volumes;
-    p.sequence_number = sequence_number;
-    return p;
-}
-
-inline PayloadTradeTicks make_trade_ticks(
-    const std::array<Id_t, MAX_TRADES_PER_TICK>& trade_id,
-    const std::array<Price_t, MAX_TRADES_PER_TICK>& price,
-    const std::array<Volume_t, MAX_TRADES_PER_TICK>& quantity,
-    const std::array<Side, MAX_TRADES_PER_TICK>& taker_side,
-    const std::array<Time_t, MAX_TRADES_PER_TICK>& timestamp,
-    uint16_t tick_count,
-    Id_t sequence_number
-) {
-    PayloadTradeTicks p{};
-    p.trade_id = trade_id;
-    p.price = price;
-    p.quantity = quantity;
-    p.taker_side = taker_side;
-    p.timestamp = timestamp;
-    p.tick_count = tick_count;
     p.sequence_number = sequence_number;
     return p;
 }

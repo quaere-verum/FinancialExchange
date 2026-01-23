@@ -1,218 +1,374 @@
-#pragma once
-#include <cstddef>
-#include <iomanip>
-#include <iostream>
-#include <memory>
-#include <string>
-#include <vector>
-
-#include <boost/asio/connect.hpp>
-#include <boost/asio/buffers_iterator.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/error.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/endian/conversion.hpp>
-#include <boost/system/error_code.hpp>
-#include <boost/asio/bind_executor.hpp>
-
 #include "connectivity.hpp"
-#include "error.hpp"
+#include <boost/asio/write.hpp>
+#include <algorithm>
 #include "logging.hpp"
-#include "protocol.hpp"
-
-namespace error = boost::asio::error;
-namespace ip = boost::asio::ip;
-using boost::asio::ip::tcp;
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-
-// Theoretical maximum size of an (IPv4) UDP packet (actual maximum is lower).
-constexpr size_t READ_SIZE = 65535;
-
 Connection::Connection(
-    boost::asio::io_context& context, 
-    tcp::socket&& socket, 
-    Id_t id, 
-    boost::asio::strand<boost::asio::any_io_executor>* exchange_strand
+    boost::asio::io_context& context,
+    tcp::socket&& socket,
+    Id_t id,
+    InboundQueue& inbound_to_engine,
+    OutboundQueue& outbound_from_engine
 )
-    : context_(context),
-      in_buffer_(),
-      out_buffer_(),
-      socket_(std::move(socket)),
-      id_(id),
-      io_strand_(socket_.get_executor()),
-      on_message_strand_(exchange_strand) {
-        set_name(std::to_string(id));
-      }
+  : context_(context)
+  , socket_(std::move(socket))
+  , id_(id)
+  , io_strand_(socket_.get_executor())
+  , inbound_to_engine_(inbound_to_engine)
+  , outbound_from_engine_(outbound_from_engine) {
+        in_accum_.resize(READ_SIZE * 2);
+        in_used_ = 0;
+    }
 
 Connection::~Connection() {
-    RLOG(LG_CON, LogLevel::LL_INFO) << std::quoted(name_, '\'') << " closing";
-    if (socket_.is_open()) {
-        socket_.close();
-    }
-}
-
-void Connection::async_read() {
-    auto buf = in_buffer_.prepare(READ_SIZE);
-    socket_.async_read_some(
-        buf,
-        boost::asio::bind_executor(
-            io_strand_,
-            [this](const boost::system::error_code& error, size_t size) {
-                read_some_handler(error, size);
-            }
-        )
-    );
+    close();
 }
 
 void Connection::close() {
     boost::system::error_code ec;
     socket_.close(ec);
+    if (ec) {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " socket.close error: " << ec.message() << '\n';
+    } else {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " socket closed\n";
+    }
 }
 
-void Connection::read_some_handler(const boost::system::error_code& error, size_t size) {
-    if (error) {
-        if (error == error::eof) {
-            RLOG(LG_CON, LogLevel::LL_INFO) << std::quoted(name_, '\'') << " remote disconnect";
-        } else if (error == error::interrupted || error == error::try_again || error == error::would_block) {
-            RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " read interrupted: " << error.message();
-            async_read();
-            return;
-        } else {
-            RLOG(LG_CON, LogLevel::LL_ERROR) << std::quoted(name_, '\'') << " read error: " << error.message();
-        }
-        on_disconnect();
+void Connection::notify_disconnect_once_(const boost::system::error_code& ec) {
+    bool expected = false;
+    if (!disconnect_notified_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
     }
 
-    RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " received " << size << " bytes";
-    in_buffer_.commit(size);
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " disconnect notified: " << ec.message() << '\n';
 
-    auto bufs = in_buffer_.data();
-    auto it = boost::asio::buffers_begin(bufs);
-    auto end = boost::asio::buffers_end(bufs);
+    close();
 
-    const uint8_t* begin = reinterpret_cast<const uint8_t*>(&(*it));
-    const uint8_t* upto = begin;
+    if (disconnected) {
+        disconnected(this);
+    }
+}
 
-    size_t available = in_buffer_.size();
-    
-    while (available >= MESSAGE_HEADER_SIZE) {
-        uint8_t message_type = upto[0];
-        uint16_t payload_size;
-        std::memcpy(&payload_size, &upto[1], sizeof(payload_size));
-        size_t expected_payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
+void Connection::notify_inbound_ready_() noexcept {
+    if (!inbound_ready) return;
 
-        if ((static_cast<size_t>(payload_size) != expected_payload_size) && (expected_payload_size > 0)) {
-            RLOG(LG_CON, LogLevel::LL_ERROR)
-                << std::quoted(name_, '\'') << " invalid payload size=" << payload_size;
-            on_disconnect();
+    bool expected = false;
+    if (!inbound_ready_pending_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return; // already scheduled
+    }
+
+    boost::asio::post(io_strand_, [this] {
+        inbound_ready_pending_.store(false, std::memory_order_release);
+        if (inbound_ready && !disconnect_notified_.load(std::memory_order_acquire)) {
+            inbound_ready();
+        }
+    });
+}
+
+void Connection::async_read() {
+    boost::asio::dispatch(io_strand_, [this] { start_read_(); });
+}
+
+void Connection::start_read_() {
+  socket_.async_read_some(
+      boost::asio::buffer(read_tmp_.data(), read_tmp_.size()),
+      boost::asio::bind_executor(
+          io_strand_,
+          [this](const boost::system::error_code& ec, size_t n) {
+            handle_read_(ec, n);
+          }
+      )
+  );
+}
+
+void Connection::handle_read_(const boost::system::error_code& ec, size_t n) {
+    if (ec) {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " read error/disconnect: "
+               << ec.message() << " (bytes_read=" << n << ")\n";
+        notify_disconnect_once_(ec);
+        return;
+    }
+
+    if (in_used_ + n > in_accum_.size()) {
+        size_t new_sz = in_accum_.size();
+        while (new_sz < in_used_ + n) {
+            new_sz *= 2;
+        }
+        in_accum_.resize(new_sz);
+    }
+
+    std::memcpy(in_accum_.data() + in_used_, read_tmp_.data(), n);
+    in_used_ += n;
+
+    parse_accumulator_();
+    if (!disconnect_notified_.load(std::memory_order_acquire)) {
+        start_read_();
+    }
+}
+
+void Connection::parse_accumulator_() {
+    size_t offset = 0;
+
+    while (true) {
+        if (in_used_ - offset < WIRE_HEADER_SIZE) {
+            break;
+        }
+
+        const uint8_t type_u8 = in_accum_[offset + 0];
+        const uint16_t payload_size = read_u16_be(in_accum_.data() + offset + 1);
+
+        const size_t frame_sz = WIRE_HEADER_SIZE + payload_size;
+        if (in_used_ - offset < frame_sz) {
+            break; // partial frame, wait for more bytes
+        }
+
+        if (payload_size > MAX_PAYLOAD_SIZE) {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                   << " protocol violation: payload_size=" << payload_size
+                   << " > MAX_PAYLOAD_SIZE=" << MAX_PAYLOAD_SIZE
+                   << " (type_u8=" << static_cast<unsigned>(type_u8)
+                   << "); closing\n";
+            notify_disconnect_once_(boost::asio::error::fault);
             return;
         }
 
-        if (available < payload_size + MESSAGE_HEADER_SIZE) {
-            break;
-        }
-        const uint8_t* payload_ptr = upto + MESSAGE_HEADER_SIZE;
+        const Message_t message_type = static_cast<Message_t>(static_cast<MessageType>(type_u8));
+        const uint8_t* payload_ptr = in_accum_.data() + offset + WIRE_HEADER_SIZE;
 
-        std::vector<uint8_t> payload(payload_ptr, payload_ptr + payload_size);
-
-        boost::asio::post(*on_message_strand_,
-            [this, message_type, payload = std::move(payload)]() mutable {
-                on_message_received(message_type, payload.data());
+        if (payload_size <= MAX_PAYLOAD_SIZE_BUFFER) {
+            InboundMessage msg{};
+            msg.connection_id = id_;
+            msg.message_type = message_type;
+            msg.payload_size = payload_size;
+            if (payload_size) {
+                std::memcpy(msg.payload.data(), payload_ptr, payload_size);
             }
-        );
 
-        upto += payload_size + MESSAGE_HEADER_SIZE;
-        available -= payload_size + MESSAGE_HEADER_SIZE;
+            if (!inbound_to_engine_.try_push(msg)) {
+                // Backpressure policy: disconnect on sustained overload.
+                RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                       << " inbound queue backpressure: try_push failed "
+                       << "(type_u8=" << static_cast<unsigned>(type_u8)
+                       << " payload_size=" << payload_size
+                       << "); closing\n";
+                notify_disconnect_once_(boost::asio::error::no_buffer_space);
+                return;
+            }
+            notify_inbound_ready_();
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                   << " inbound frame queued: type_u8=" << static_cast<unsigned>(type_u8)
+                   << " payload_size=" << payload_size
+                   << " frame_sz=" << frame_sz
+                   << '\n';
+            offset += frame_sz;
+        } else {
+            if (large_message_received) {
+                RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                   << " large inbound frame: type_u8=" << static_cast<unsigned>(type_u8)
+                   << " payload_size=" << payload_size
+                   << " (unbuffered callback path)\n";
+                auto buf = std::make_shared<std::vector<uint8_t>>(payload_size);
+                if (payload_size) std::memcpy(buf->data(), payload_ptr, payload_size);
+                large_message_received(id_, message_type, std::move(buf));
+            }
+            offset += frame_sz;
+        }
+
     }
 
-    in_buffer_.consume(upto - begin);
-    async_read();
+    if (offset > 0) {
+        const size_t remaining = in_used_ - offset;
+        if (remaining) {
+            std::memmove(in_accum_.data(), in_accum_.data() + offset, remaining);
+        }
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+               << " parse consumed " << offset
+               << " bytes; remaining=" << remaining
+               << '\n';
+        in_used_ = remaining;
+    }
 }
 
-void Connection::send() {
-    is_sending_ = true;
-    socket_.async_write_some(
-        out_buffer_.data(),
+void Connection::send_message(Message_t type, const void* payload) noexcept {
+    const uint16_t payload_size =
+        payload_size_for_type(static_cast<MessageType>(type));
+
+    // Enforce buffered size (order book snapshot excluded by design)
+    if (payload_size > MAX_PAYLOAD_SIZE_BUFFER) {
+        return;
+    }
+
+    OutboundMessage msg{};
+    msg.connection_id = id_;
+    msg.message_type = type;
+    msg.payload_size = payload_size;
+    if (payload_size) {
+        std::memcpy(msg.payload.data(), payload, payload_size);
+    }
+
+    if (!outbound_from_engine_.try_push(msg)) {
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+               << " outbound queue backpressure: try_push failed "
+               << "(type=" << static_cast<unsigned>(type)
+               << " payload_size=" << payload_size << ")\n";
+        return;
+    }
+
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+           << " outbound queued: type=" << static_cast<unsigned>(type)
+           << " payload_size=" << payload_size
+           << '\n';
+
+    schedule_drain_writes_();
+}
+
+void Connection::send_message_unbuffered(Message_t type, const void* payload, uint16_t payload_size) noexcept {
+    if (payload_size == 0 || payload == nullptr) {
+        return;
+    }
+
+    constexpr size_t header_size = 1 + 2;
+    const size_t frame_size = header_size + static_cast<size_t>(payload_size);
+
+    // Allocate heap buffer so it stays alive until async_write completes.
+    auto buffer = std::make_shared<std::vector<uint8_t>>(frame_size);
+    (*buffer)[0] = static_cast<uint8_t>(static_cast<MessageType>(type));
+
+    // Serialize payload size as little-endian u16
+    (*buffer)[1] = static_cast<uint8_t>((payload_size >> 8) & 0xFF);
+    (*buffer)[2] = static_cast<uint8_t>(payload_size & 0xFF);
+
+
+    std::memcpy(buffer->data() + header_size, payload, payload_size);
+
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+           << " send_message_unbuffered scheduled: type=" << static_cast<unsigned>(type)
+           << " payload_size=" << payload_size
+           << " frame_size=" << frame_size
+           << '\n';
+
+    boost::asio::post(io_strand_, [this, buffer]() {
+    if (!socket_.is_open()) return;
+
+    boost::asio::async_write(
+        socket_,
+        boost::asio::buffer(*buffer),
         boost::asio::bind_executor(
             io_strand_,
-            [this](const boost::system::error_code& err, size_t sz) {
-                write_some_handler(err, sz);
+            [this, buffer](const boost::system::error_code& ec, size_t /*n*/) {
+                if (ec) {
+                    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                               << " unbuffered write error/disconnect: "
+                               << ec.message() << "\n";
+                    notify_disconnect_once_(ec);
+                }
+            }));
+    });
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                           << " unbuffered write complete: bytes_written=" << frame_size
+                           << " (type=" << type
+                           << " payload_size=" << payload_size << ")\n";
+}
+
+
+void Connection::schedule_drain_writes_() noexcept {
+    bool expected = false;
+    if (write_wakeup_pending_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        boost::asio::post(io_strand_, [this] { drain_writes_(); });
+    }
+}
+
+void Connection::drain_writes_() {
+    write_wakeup_pending_.store(false, std::memory_order_release);
+
+    if (write_in_progress_) {
+        return;
+    }
+
+    out_batch_len_ = 0;
+    out_batch_sent_ = 0;
+
+    while (true) {
+        const OutboundMessage* m = outbound_from_engine_.peek();
+        if (!m) break;
+
+        const uint16_t psz = m->payload_size;
+        const size_t frame_sz = WIRE_HEADER_SIZE + psz;
+
+        if (out_batch_len_ + frame_sz > out_batch_.size()) {
+            RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+                   << " drain_writes_: batch full at len=" << out_batch_len_
+                   << " next_frame_sz=" << frame_sz
+                   << " batch_capacity=" << out_batch_.size()
+                   << '\n';
+            break;
+        }
+
+        out_batch_[out_batch_len_ + 0] = static_cast<uint8_t>(static_cast<MessageType>(m->message_type));
+        write_u16_be(out_batch_.data() + out_batch_len_ + 1, psz);
+        if (psz) {
+            std::memcpy(out_batch_.data() + out_batch_len_ + WIRE_HEADER_SIZE, m->payload.data(), psz);
+        }
+
+        out_batch_len_ += frame_sz;
+        outbound_from_engine_.consume_one();
+        }
+
+        if (out_batch_len_ == 0) {
+        return;
+    }
+
+    start_write_();
+}
+
+void Connection::start_write_() {
+    write_in_progress_ = true;
+
+    const size_t remaining = out_batch_len_ - out_batch_sent_;
+    socket_.async_write_some(
+        boost::asio::buffer(out_batch_.data() + out_batch_sent_, remaining),
+        boost::asio::bind_executor(
+            io_strand_,
+            [this](const boost::system::error_code& ec, size_t n) {
+            handle_write_(ec, n);
             }
         )
     );
 }
 
-void Connection::send(SendMode mode) {
-    if (mode == SendMode::ASAP) {
-        send();
-    } else if (!is_send_posted_) {
-        boost::asio::post(
-            io_strand_,
-            [this] {
-                is_send_posted_ = false;
-                if (!is_sending_) {
-                    send();
-                }
-            }
-        );
-        is_send_posted_ = true;
-    }
-}
-
-void Connection::send_message(Message_t message_type, const void* payload, SendMode mode) {
-    const size_t payload_size = payload_size_for_type(static_cast<MessageType>(message_type));
-    std::vector<uint8_t> copy(
-        static_cast<const uint8_t*>(payload),
-        static_cast<const uint8_t*>(payload) + payload_size
-    );
-
-    boost::asio::post(
-        io_strand_,
-        [this, message_type, mode, copy = std::move(copy)]() mutable {
-            const uint16_t payload_size = static_cast<uint16_t>(copy.size());
-
-            auto buf = out_buffer_.prepare(copy.size() + MESSAGE_HEADER_SIZE);
-            auto* data = static_cast<uint8_t*>(buf.data());
-            serialize_message(data, static_cast<MessageType>(message_type), copy.data(), payload_size);
-            // data[0] = static_cast<uint8_t>(message_type);
-            // std::memcpy(data + 1, &payload_size, sizeof(payload_size));
-            // std::memcpy(data + MESSAGE_HEADER_SIZE, copy.data(), payload_size);
-            out_buffer_.commit(copy.size() + MESSAGE_HEADER_SIZE);
-
-            if (!is_sending_) {
-                send(mode);
-            }
-        }
-    );
-}
-
-void Connection::write_some_handler(const boost::system::error_code& error, size_t size) {
-    if (error) {
-        if (error != error::interrupted && error != error::would_block && error != error::try_again) {
-            RLOG(LG_CON, LogLevel::LL_ERROR) << std::quoted(name_, '\'') << " send failed: " << error.message();
-            throw TGError("send failed: " + error.message());
-        }
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " send interrupted: " << error.message();
-    } else {
-        RLOG(LG_CON, LogLevel::LL_DEBUG) << std::quoted(name_, '\'') << " sent " << size << " bytes";
-        out_buffer_.consume(size);
+void Connection::handle_write_(const boost::system::error_code& ec, size_t n) {
+    if (ec) {
+        write_in_progress_ = false;
+        RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_
+               << " write error/disconnect: " << ec.message()
+               << " (bytes_written=" << n
+               << " batch_sent=" << out_batch_sent_
+               << " batch_len=" << out_batch_len_
+               << ")\n";
+        notify_disconnect_once_(ec);
+        return;
     }
 
-    if (out_buffer_.size() > 0) {
-        socket_.async_write_some(
-            out_buffer_.data(),
-            boost::asio::bind_executor(
-                io_strand_,
-                [this](const boost::system::error_code& err, size_t sz) {
-                    write_some_handler(err, sz);
-                }
-            )
-        );
-    } else {
-        is_sending_ = false;
+    out_batch_sent_ += n;
+
+    if (out_batch_sent_ < out_batch_len_) {
+        start_write_();
+        return;
+    }
+
+    write_in_progress_ = false;
+
+    RLOG(LG_CON, LogLevel::LL_DEBUG) << "conn=" << id_ << " write batch complete: total=" << out_batch_len_ << '\n';; 
+
+    if (outbound_from_engine_.peek() != nullptr) {
+        drain_writes_();
+        return;
+    }
+
+    bool expected = true;
+    if (write_wakeup_pending_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+        drain_writes_();
     }
 }

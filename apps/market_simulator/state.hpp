@@ -63,6 +63,8 @@ struct FlowState {
     double volume_surprise = 0.0;
     double signed_volume_ewma = 0.0;
     double flow_imbalance = 0.0;
+    double taker_sign_ewma = 0.0;
+    double trade_excitation = 0.0;
 };
 
 struct LatentState {
@@ -114,6 +116,7 @@ class SimulationState {
             update_liq_state(order_book);
             update_time_state(dt);
             update_latent_state(dt);
+            decay_trade_excitation(dt);
         }
 
         void on_trade(const PayloadTradeEvent* trade) {
@@ -126,6 +129,7 @@ class SimulationState {
             if (dt <= 0.0) {return;}
             update_vol_state(trade, dt);
             update_flow_state(trade, dt);
+            bump_trade_excitation(trade);
             last_trade_price_ = trade->price;
             last_trade_timestamp_ = trade->timestamp;
         }
@@ -310,6 +314,7 @@ class SimulationState {
             const double a_flow = 1.0 - std::exp(-dt / TAU_FLOW);
             const double a_rate = 1.0 - std::exp(-dt / TAU_RATE);
             const double a_surp = 1.0 - std::exp(-dt / TAU_SURPRISE);
+            const double a_sign = 1.0 - std::exp(-dt / TAU_SIGN);
 
             fs.abs_volume_ewma = (1.0 - a_flow) * fs.abs_volume_ewma + a_flow * vol;
 
@@ -331,10 +336,26 @@ class SimulationState {
             fs.flow_imbalance = std::clamp(fs.signed_volume_ewma / (fs.abs_volume_ewma + 1e-8), -1.0, 1.0);
 
             const double expected_vol = std::max(fs.abs_volume_ewma, 1e-8);
-
             const double surprise = (vol - expected_vol) / expected_vol;
-
             fs.volume_surprise = (1.0 - a_surp) * fs.volume_surprise + a_surp * surprise;
+
+            const double sign = (trade->taker_side == Side::BUY ? 1.0 : -1.0);
+            fs.taker_sign_ewma = (1.0 - a_sign) * fs.taker_sign_ewma + a_sign * sign;
+            fs.taker_sign_ewma = std::clamp(fs.taker_sign_ewma, -1.0, 1.0);
+        }
+
+        inline void bump_trade_excitation(const PayloadTradeEvent* trade) {
+            FlowState& fs = flow_state_;
+            const double q = static_cast<double>(trade->quantity);
+            const double bump = std::clamp(0.05 + 0.02 * std::log1p(q) + 0.10 * std::abs(fs.flow_imbalance), 0.05, 0.5);
+            fs.trade_excitation += bump;
+            fs.trade_excitation = std::min(fs.trade_excitation, 5.0);
+        }
+
+        inline void decay_trade_excitation(double dt) {
+            FlowState& fs = flow_state_;
+            const double a = 1.0 - std::exp(-dt / TAU_EXCITE);
+            fs.trade_excitation *= (1.0 - a);
         }
 
 
@@ -361,6 +382,9 @@ class SimulationState {
         static constexpr double TAU_FLOW = 2.0;
         static constexpr double TAU_RATE = 5.0;
         static constexpr double TAU_SURPRISE = 10.0;
+        static constexpr double TAU_SIGN   = 3.0;
+        static constexpr double TAU_EXCITE = 2.0;
+
 
         static constexpr double VOL_MIN = 1e-6;
 };

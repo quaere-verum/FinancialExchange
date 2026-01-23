@@ -14,10 +14,10 @@ int main(int argc, char* argv[]) {
     try {
         auto core = boost::log::core::get();
         core->set_filter(
-            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_INFO
+            boost::log::expressions::attr<LogLevel>("Severity") >= LogLevel::LL_ERROR
         );
         uint16_t port = 16000;
-        std::size_t io_threads = 3;
+        std::size_t io_threads = 1;
 
         if (argc > 1) {
             int p = std::atoi(argv[1]);

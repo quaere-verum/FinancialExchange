@@ -20,6 +20,7 @@ class RNG {
 
         virtual bool bernoulli(double p) = 0;
 		virtual uint32_t uniform_int(uint32_t lower_bound, uint32_t upper_bound) = 0;
+		virtual uint32_t poisson(double mean) = 0;
         virtual size_t categorical(const std::vector<double>& cumulative_probs) = 0;
 
         virtual void normal_vector(std::vector<double>& out) = 0;

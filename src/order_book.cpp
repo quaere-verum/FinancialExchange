@@ -195,12 +195,14 @@ Volume_t OrderBookSide::match_loop(
     Side maker_side,
     PriceCrossFn crosses,
     BestPriceFn advance_best,
-    std::unordered_map<Id_t, Order*>& order_index
+    std::vector<Order*>& order_by_handle,
+    std::unordered_map<Id_t, Id_t>& order_id_to_handle
 ) noexcept {
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with id=" << order_id 
     << ", qty=" << incoming_quantity << ", p=" << incoming_price << " entering matching process.";
     Time_t now = utc_now_ns();
     Volume_t total_incoming_quantity = incoming_quantity;
+    auto* cb = callbacks_;
 
     while (incoming_quantity > 0) {
 
@@ -231,7 +233,7 @@ Volume_t OrderBookSide::match_loop(
 
             RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with ID " << order_id << " matched.";
 
-            callbacks_->on_trade(
+            cb->on_trade(
                 *maker,
                 client_id,
                 order_id,
@@ -251,12 +253,14 @@ Volume_t OrderBookSide::match_loop(
                     level->last_ = nullptr;
                     advance_best();
                 }
-                order_index.erase(maker->order_id_);
+                order_id_to_handle.erase(maker->order_id_);
+                Id_t encoded = maker->order_handle_ * 2 + (maker->is_bid_ ? 0 : 1);
+                order_by_handle[encoded] = nullptr;
                 pool_.deallocate(maker);
             }
             _debug_check_level_invariant(*level);
         }
-        callbacks_->on_level_update(maker_side, *level, now);
+        cb->on_level_update(maker_side, *level, now);
     }
     return incoming_quantity;
 }
@@ -267,7 +271,8 @@ Volume_t OrderBookSide::match_buy(
     Volume_t incoming_quantity,
     Id_t order_id,
     Id_t client_id,
-    std::unordered_map<Id_t, Order*>& order_index
+    std::vector<Order*>& order_by_handle,
+    std::unordered_map<Id_t, Id_t>& order_id_to_handle
 ) noexcept {
     return match_loop(
         incoming_price,
@@ -277,7 +282,8 @@ Volume_t OrderBookSide::match_buy(
         Side::SELL,
         [](Price_t level_price, Price_t incoming) {return level_price <= incoming;},
         [this]() {update_best_ask_after_empty();},
-        order_index
+        order_by_handle,
+        order_id_to_handle
     );
 }
 
@@ -286,7 +292,8 @@ Volume_t OrderBookSide::match_sell(
     Volume_t incoming_quantity,
     Id_t order_id,
     Id_t client_id,
-    std::unordered_map<Id_t, Order*>& order_index
+    std::vector<Order*>& order_by_handle,
+    std::unordered_map<Id_t, Id_t>& order_id_to_handle
 ) noexcept {
     return match_loop(
         incoming_price,
@@ -296,7 +303,8 @@ Volume_t OrderBookSide::match_sell(
         Side::BUY,
         [](Price_t level_price, Price_t incoming) {return level_price >= incoming;},
         [this]() {update_best_bid_after_empty();},
-        order_index
+        order_by_handle,
+        order_id_to_handle
     );
 }
 
@@ -319,7 +327,8 @@ void OrderBookSide::print_side(const char* name) const {
 }
 
 OrderBook::OrderBook() : bids(true), asks(false), order_id_(0), trade_id_(0) {
-    order_index_.reserve(MAX_ORDERS);
+    order_by_handle_.resize(2 * MAX_ORDERS, nullptr);
+    order_id_to_handle_.reserve(2 * MAX_ORDERS);
     asks.set_callbacks(callbacks_);
     bids.set_callbacks(callbacks_);
 }
@@ -357,22 +366,29 @@ void OrderBook::submit_order(Price_t price, Volume_t quantity, bool is_bid, Id_t
     Volume_t remaining = quantity;
 
     if (is_bid) {
-        remaining = asks.match_buy(price, quantity, order_id, client_id, order_index_);
+        remaining = asks.match_buy(price, quantity, order_id, client_id, order_by_handle_, order_id_to_handle_);
         if (remaining > 0) {
             Order* resting_order = bids.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
-            order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(client_request_id, *resting_order, now);
+            if (resting_order) {
+                Id_t encoded_handle = resting_order->order_handle_ * 2;
+                order_by_handle_[encoded_handle] = resting_order;
+                order_id_to_handle_.emplace(order_id, encoded_handle);
+                callbacks_->on_order_inserted(client_request_id, *resting_order, now);
+            }
         }
     } else {
-        remaining = bids.match_sell(price, quantity, order_id, client_id, order_index_);
+        remaining = bids.match_sell(price, quantity, order_id, client_id, order_by_handle_, order_id_to_handle_);
         if (remaining > 0) {
             Order* resting_order = asks.add_order(price, quantity, remaining, order_id, client_id, client_request_id);
-            order_index_[order_id] = resting_order;
-            callbacks_->on_order_inserted(client_request_id, *resting_order, now);
+            if (resting_order) {
+                Id_t encoded_handle = resting_order->order_handle_ * 2 + 1;
+                order_by_handle_[encoded_handle] = resting_order;
+                order_id_to_handle_.emplace(order_id, encoded_handle);
+                callbacks_->on_order_inserted(client_request_id, *resting_order, now);
+            }
         }
     }
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBook] Order from " << client_id << " with request ID " << client_request_id << " matched against resting orders.";
-    RLOG(LG_CON, LogLevel::LL_INFO) << "[OrderBook] order_index_.size()=" << order_index_.size() << "\n";
 
     _debug_check_level_integrity(*this);
 }
@@ -384,8 +400,20 @@ void OrderBook::print_book() const {
 
 void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_id) noexcept {
     Time_t now = utc_now_ns();
-    auto order_idx = order_index_.find(order_id);
-    if (order_idx == order_index_.end()) {
+    auto it = order_id_to_handle_.find(order_id);
+    if (it == order_id_to_handle_.end()) {
+        callbacks_->on_error(
+            client_id,
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::ORDER_NOT_FOUND),
+            "Order ID not found.",
+            now
+        );
+        return;
+    }
+    Id_t order_handle = it->second;
+    Order* order = order_by_handle_[order_handle];
+    if (!order) {
         callbacks_->on_error(
             client_id, 
             client_request_id,
@@ -395,8 +423,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
         );
         return;
     } 
-
-    Order* order = order_idx->second;
+    assert(order_id == order->order_id_);
     if (order->client_id_ != client_id) {
         callbacks_->on_error(
             client_id, 
@@ -417,7 +444,7 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
     level.total_quantity_ -= order->quantity_remaining_;
 
     Order order_snapshot = *order;
-    remove_order(order_idx->first, order, side, level);
+    remove_order(order, side, level);
 
     if (!level.first_ && side.best_price_index_ == level.idx_) {
         if (order->is_bid_)
@@ -434,8 +461,20 @@ void OrderBook::cancel_order(Id_t client_id, Id_t client_request_id, Id_t order_
 
 void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_id, Volume_t quantity_new) noexcept {
     Time_t now = utc_now_ns();
-    auto order_idx = order_index_.find(order_id);
-    if (order_idx == order_index_.end()) {
+    auto it = order_id_to_handle_.find(order_id);
+    if (it == order_id_to_handle_.end()) {
+        callbacks_->on_error(
+            client_id,
+            client_request_id,
+            static_cast<uint16_t>(ErrorType::ORDER_NOT_FOUND),
+            "Order ID not found.",
+            now
+        );
+        return;
+    }
+    Id_t order_handle = it->second;
+    Order* order = order_by_handle_[order_handle];
+    if (!order) {
         callbacks_->on_error(
             client_id, 
             client_request_id,
@@ -445,8 +484,7 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
         );
         return;
     } 
-
-    Order* order = order_idx->second;
+    assert(order_id == order->order_id_);
     if (order->client_id_ != client_id) {
         callbacks_->on_error(
             client_id, 
@@ -522,13 +560,13 @@ void OrderBook::amend_order(Id_t client_id, Id_t client_request_id, Id_t order_i
     callbacks_->on_order_amended(client_request_id, quantity_old_total, order_snapshot, now);
     callbacks_->on_level_update(order_snapshot.is_bid_ ? Side::BUY : Side::SELL, level, now);
     if (quantity_new_remaining == 0) {
-        remove_order(order_idx->first, order, side, level);
+        remove_order(order, side, level);
     }
     
     _debug_check_level_invariant(level);
 }
 
-void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, PriceLevel& level) {
+void OrderBook::remove_order(Order* order, OrderBookSide& side, PriceLevel& level) {
     if (order->previous_) {
         order->previous_->next_ = order->next_;
     } else {
@@ -539,11 +577,11 @@ void OrderBook::remove_order(Id_t order_idx, Order* order, OrderBookSide& side, 
     } else {
         level.last_ = order->previous_;
     }
+    const Id_t order_id = order->order_id_;
+    const Id_t encoded = order->order_handle_ * 2 + (order->is_bid_ ? 0 : 1);
+    order_by_handle_[encoded] = nullptr;
+    order_id_to_handle_.erase(order_id);
     side.pool_.deallocate(order);
-    order_index_.erase(order_idx);
-    #ifndef NDEBUG
-    std::cout << "[OrderBook] Order removed.\n";
-    #endif
 }
 
 void OrderBook::build_snapshot(

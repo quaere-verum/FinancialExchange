@@ -86,6 +86,11 @@ class PCGRNG final : public RNG {
             return dist(rng_);
         }
 
+        inline uint32_t poisson(double mean) {
+            std::poisson_distribution<uint32_t> dist(mean);
+            return dist(rng_);
+        }
+
         inline size_t categorical(const std::vector<double>& cumulative_probs) override {
             // Linear scan because nr of categories assumed to be small (<10)
             assert(cumulative_probs.back() > 0.999999);

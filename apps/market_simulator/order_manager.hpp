@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <atomic>
+#include <cassert>
 
 #include "types.hpp"
 #include "protocol.hpp"
@@ -12,18 +13,18 @@
 class OrderManager {
     public:
         OrderManager(
-            boost::asio::io_context& io,
+            boost::asio::strand<boost::asio::io_context::executor_type>& strand,
             Connection& connection,
             std::atomic<Id_t>& request_id
         )
-        : strand_(boost::asio::make_strand(io))
-        , timer_(io)
+        : strand_(strand)
+        , timer_(strand_)
         , connection_(connection)
         , client_request_id_(request_id)
         {}
 
         void register_pending_insert(Id_t client_request_id, double hazard_threshold) {
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, client_request_id, hazard_threshold] {
                     pending_inserts_[client_request_id] = hazard_threshold;
@@ -35,7 +36,7 @@ class OrderManager {
             const Id_t client_id = msg->client_request_id;
             const Id_t exchange_id = msg->exchange_order_id;
 
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, client_id, exchange_id] {
                     auto it = pending_inserts_.find(client_id);
@@ -58,7 +59,7 @@ class OrderManager {
                 return;
             }
 
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, exchange_id = msg->exchange_order_id] {
                     active_orders_.erase(exchange_id);
@@ -67,7 +68,7 @@ class OrderManager {
         }
 
         void update_cancel_rate(double lambda_cancel) {
-            boost::asio::post(
+            boost::asio::dispatch(
                 strand_,
                 [this, lambda_cancel] {
                     advance_hazard_to_now();
@@ -78,10 +79,18 @@ class OrderManager {
         }
 
         size_t open_order_count() const {
+            #ifndef NDEBUG
+                assert(strand_.running_in_this_thread());
+            #endif
             return active_orders_.size();
         }
 
-        const double cumulative_hazard() const {return cumulative_hazard_;}
+        const double cumulative_hazard() const {
+            #ifndef NDEBUG
+                assert(strand_.running_in_this_thread());
+            #endif
+            return cumulative_hazard_;
+        }
 
     private:
         struct HazardEntry {
@@ -109,76 +118,97 @@ class OrderManager {
         void reschedule_next_expiry() {
             timer_.cancel();
 
-            if (expiry_queue_.empty() || lambda_cancel_ <= 0.0) {
-                return;
-            }
+            advance_hazard_to_now();
+
+            if (lambda_cancel_ <= 0.0) return;
+
+            prune_top_();
+            if (expiry_queue_.empty()) return;
 
             const auto& next = expiry_queue_.top();
+            const double remaining_hazard = next.hazard_threshold - cumulative_hazard_;
 
-            double remaining_hazard = next.hazard_threshold - cumulative_hazard_;
-
+            // If due (or past due), process immediately in the strand to avoid recursion.
             if (remaining_hazard <= 0.0) {
                 boost::asio::post(
                     strand_,
-                    [this] {
-                        fire_next_expiry(boost::system::error_code{});
-                    }
+                    [this] { fire_next_expiry(boost::system::error_code{}); }
                 );
                 return;
             }
 
-
-            double dt = remaining_hazard / lambda_cancel_;
-
-            timer_.expires_after(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(dt)));
+            const double dt = remaining_hazard / lambda_cancel_;
+            timer_.expires_after(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(dt)
+                )
+            );
 
             timer_.async_wait(
                 boost::asio::bind_executor(
                     strand_,
-                    [this](const boost::system::error_code& ec) {
-                        fire_next_expiry(ec);
-                    }
+                    [this](const boost::system::error_code& ec) { fire_next_expiry(ec); }
                 )
             );
         }
 
         void fire_next_expiry(const boost::system::error_code& ec) {
-            if (ec == boost::asio::error::operation_aborted)
-                return;
+            if (ec == boost::asio::error::operation_aborted) return;
 
             advance_hazard_to_now();
 
-            if (expiry_queue_.empty())
-                return;
-
-            auto entry = expiry_queue_.top();
-            expiry_queue_.pop();
-
-            if (!active_orders_.erase(entry.exchange_order_id)) {
-                reschedule_next_expiry();
+            if (lambda_cancel_ <= 0.0) {
                 return;
             }
 
-            #ifndef NDEBUG
-                std::cout << "[OrderManager] Cancelling order "
-                        << entry.exchange_order_id
-                        << " at cumulative_hazard=" << cumulative_hazard_
-                        << "\n";
-            #endif
+            prune_top_();
 
-            const Id_t client_id = client_request_id_++;
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::CANCEL_ORDER),
-                &make_cancel_order(client_id, entry.exchange_order_id),
-                SendMode::ASAP
-            );
+            while (!expiry_queue_.empty()) {
+                const auto& top = expiry_queue_.top();
+                if (top.hazard_threshold > cumulative_hazard_) {
+                    break; // next not due yet
+                }
 
+                auto entry = top;
+                expiry_queue_.pop();
+                if (!active_orders_.erase(entry.exchange_order_id)) {
+                    prune_top_();
+                    continue;
+                }
+
+                const Id_t client_id = client_request_id_++;
+                connection_.send_message(
+                    static_cast<Message_t>(MessageType::CANCEL_ORDER),
+                    &make_cancel_order(client_id, entry.exchange_order_id)
+                );
+
+                prune_top_();
+            }
+            
             reschedule_next_expiry();
         }
 
+
+        void prune_top_() {
+            while (!expiry_queue_.empty()) {
+                const auto& top = expiry_queue_.top();
+                if (active_orders_.find(top.exchange_order_id) != active_orders_.end()) {
+                    break; // top is live
+                }
+                expiry_queue_.pop(); // dead entry
+            }
+        }
+
+        bool top_is_due_() const {
+            if (expiry_queue_.empty()) return false;
+            return expiry_queue_.top().hazard_threshold <= cumulative_hazard_;
+        }
+
+
     private:
-        boost::asio::strand<boost::asio::any_io_executor> strand_;
+        boost::asio::strand<boost::asio::io_context::executor_type>& strand_;
         boost::asio::steady_timer timer_;
+
         Connection& connection_;
         std::atomic<Id_t>& client_request_id_;
 
