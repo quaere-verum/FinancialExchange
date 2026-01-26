@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 project(FinancialExchange LANGUAGES CXX)
 add_compile_definitions(_WIN32_WINNT=0x0603 WINVER=0x0603)
 

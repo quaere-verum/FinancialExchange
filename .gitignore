@@ -3,6 +3,7 @@
 *.exe
 *.csv
 logs/
+out/
 .vscode/
 build/
 __pycache__/
