@@ -9,11 +9,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
-#include <queue>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "protocol.hpp"
@@ -25,68 +25,64 @@ namespace fs = std::filesystem;
 
 class ShadowOrderBook {
 public:
-    explicit ShadowOrderBook(size_t expected_levels = 100) {
-        bid_vol_.reserve(expected_levels);
-        ask_vol_.reserve(expected_levels);
-    }
+    explicit ShadowOrderBook(size_t /*expected_levels*/ = 100) {}
 
     inline void on_price_level_update(const PayloadPriceLevelUpdate* u) {
         if (!u) return;
         if (u->side == Side::BUY) {
-            update_one_side(bid_vol_, bid_heap_, u->price, u->total_volume);
+            update_one_side(bids_, u->price, u->total_volume);
         } else {
-            update_one_side(ask_vol_, ask_heap_, u->price, u->total_volume);
+            update_one_side(asks_, u->price, u->total_volume);
         }
     }
 
-    inline std::optional<Price_t> best_bid_price() { return best_price(bid_vol_, bid_heap_); }
-    inline std::optional<Price_t> best_ask_price() { return best_price(ask_vol_, ask_heap_); }
+    inline std::optional<std::pair<Price_t, Volume_t>> best_bid() const {
+        if (bids_.empty()) return std::nullopt;
+        auto it = bids_.rbegin();
+        return std::make_optional(std::make_pair(it->first, it->second));
+    }
+
+    inline std::optional<std::pair<Price_t, Volume_t>> best_ask() const {
+        if (asks_.empty()) return std::nullopt;
+        auto it = asks_.begin();
+        return std::make_optional(std::make_pair(it->first, it->second));
+    }
+
+    inline std::optional<Price_t> best_bid_price() const {
+        auto bb = best_bid();
+        return bb ? std::make_optional(bb->first) : std::nullopt;
+    }
+
+    inline std::optional<Price_t> best_ask_price() const {
+        auto ba = best_ask();
+        return ba ? std::make_optional(ba->first) : std::nullopt;
+    }
 
     inline Volume_t volume_at(Side side, Price_t price) const {
-        const auto& m = (side == Side::BUY) ? bid_vol_ : ask_vol_;
+        const auto& m = (side == Side::BUY) ? bids_ : asks_;
         auto it = m.find(price);
         return (it == m.end()) ? static_cast<Volume_t>(0) : it->second;
     }
 
     inline void clear() {
-        bid_vol_.clear();
-        ask_vol_.clear();
-        bid_heap_ = BidHeap{};
-        ask_heap_ = AskHeap{};
+        bids_.clear();
+        asks_.clear();
     }
 
 private:
-    using Map = std::unordered_map<Price_t, Volume_t>;
-    using BidHeap = std::priority_queue<Price_t>;
-    using AskHeap = std::priority_queue<Price_t, std::vector<Price_t>, std::greater<Price_t>>;
+    using Map = std::map<Price_t, Volume_t>;
 
-    template <typename Heap>
-    static inline void update_one_side(Map& m, Heap& heap, Price_t price, Volume_t total_volume) {
+    static inline void update_one_side(Map& m, Price_t price, Volume_t total_volume) {
         if (total_volume == 0) {
             m.erase(price);
         } else {
-            m[price] = total_volume;
-            heap.push(price);
+            m.insert_or_assign(price, total_volume);
         }
     }
 
-    template <typename Heap>
-    static inline std::optional<Price_t> best_price(Map& m, Heap& heap) {
-        while (!heap.empty()) {
-            const Price_t p = heap.top();
-            auto it = m.find(p);
-            if (it != m.end() && it->second > 0) return p;
-            heap.pop();
-        }
-        return std::nullopt;
-    }
-
-    Map bid_vol_;
-    Map ask_vol_;
-    BidHeap bid_heap_;
-    AskHeap ask_heap_;
+    Map bids_;
+    Map asks_;
 };
-
 
 class BookStateWriter {
 public:
@@ -97,8 +93,15 @@ public:
     };
 
     BookStateWriter(fs::path out_dir, Config cfg)
-        : out_dir_(std::move(out_dir)), cfg_(cfg), pool_(arrow::default_memory_pool()) {
-        reset_builders();
+        : out_dir_(std::move(out_dir)),
+          cfg_(cfg),
+          pool_(arrow::default_memory_pool())
+    {
+        if (cfg_.rows_per_part <= 0) cfg_.rows_per_part = 1;
+        if (cfg_.row_group_size <= 0) cfg_.row_group_size = 1;
+
+        init_schema();
+        reset_part_storage();
     }
 
     arrow::Status append(
@@ -109,43 +112,69 @@ public:
         Volume_t best_bid_vol,
         Volume_t best_ask_vol)
     {
-        ARROW_RETURN_NOT_OK(append_numeric<Time_t>(b_ts_.get(), ts));
-        ARROW_RETURN_NOT_OK(append_numeric<Id_t>(b_seq_.get(), sequence_number));
+        const int64_t i = rows_in_part_;
+        if (i >= cfg_.rows_per_part) {
+            ARROW_RETURN_NOT_OK(flush_part());
+        }
 
-        if (best_bid) ARROW_RETURN_NOT_OK(append_numeric<Price_t>(b_bb_.get(), *best_bid));
-        else          ARROW_RETURN_NOT_OK(b_bb_->AppendNull());
+        const int64_t idx = rows_in_part_;
 
-        if (best_ask) ARROW_RETURN_NOT_OK(append_numeric<Price_t>(b_ba_.get(), *best_ask));
-        else          ARROW_RETURN_NOT_OK(b_ba_->AppendNull());
+        ts_.data[idx]  = static_cast<underlying_or_self_t<Time_t>>(ts);
+        seq_.data[idx] = static_cast<underlying_or_self_t<Id_t>>(sequence_number);
 
-        ARROW_RETURN_NOT_OK(append_numeric<Volume_t>(b_bb_vol_.get(), best_bid_vol));
-        ARROW_RETURN_NOT_OK(append_numeric<Volume_t>(b_ba_vol_.get(), best_ask_vol));
+        bb_vol_.data[idx] = static_cast<underlying_or_self_t<Volume_t>>(best_bid_vol);
+        ba_vol_.data[idx] = static_cast<underlying_or_self_t<Volume_t>>(best_ask_vol);
 
-        const bool valid = best_bid.has_value() && best_ask.has_value() && (*best_ask >= *best_bid);
-        ARROW_RETURN_NOT_OK(b_valid_->Append(valid));
+        // Nullable best bid/ask prices
+        if (best_bid) {
+            bb_.data[idx] = static_cast<underlying_or_self_t<Price_t>>(*best_bid);
+            set_valid(bb_.valid_data, idx);
+        } else {
+            clear_valid(bb_.valid_data, idx);
+        }
 
+        if (best_ask) {
+            ba_.data[idx] = static_cast<underlying_or_self_t<Price_t>>(*best_ask);
+            set_valid(ba_.valid_data, idx);
+        } else {
+            clear_valid(ba_.valid_data, idx);
+        }
+
+        // Booleans (non-nullable)
+        const bool valid_book = best_bid.has_value() && best_ask.has_value() && (*best_ask >= *best_bid);
+        set_bool(valid_.bits, idx, valid_book);
+
+        bool crossed = false;
         if (best_bid && best_ask) {
             const auto bb = static_cast<underlying_or_self_t<Price_t>>(*best_bid);
             const auto ba = static_cast<underlying_or_self_t<Price_t>>(*best_ask);
-            const bool crossed = (ba < bb);
-            ARROW_RETURN_NOT_OK(b_crossed_->Append(crossed));
+            crossed = (ba < bb);
 
             if (!crossed) {
+                // spread_ticks nullable, but becomes valid here
                 const auto spread_u = ba - bb;
-                ARROW_RETURN_NOT_OK(b_spread_->Append(static_cast<int32_t>(spread_u)));
-                ARROW_RETURN_NOT_OK(append_numeric<MidPx2_t>(b_mid_px2_.get(), static_cast<MidPx2_t>(bb + ba)));
+                spread_.data[idx] = static_cast<int32_t>(spread_u);
+                set_valid(spread_.valid_data, idx);
+
+                // mid_px2_ticks nullable, valid here
+                mid_px2_.data[idx] = static_cast<underlying_or_self_t<MidPx2_t>>(static_cast<MidPx2_t>(bb + ba));
+                set_valid(mid_px2_.valid_data, idx);
             } else {
-                ARROW_RETURN_NOT_OK(b_spread_->AppendNull());
-                ARROW_RETURN_NOT_OK(b_mid_px2_->AppendNull());
+                clear_valid(spread_.valid_data, idx);
+                clear_valid(mid_px2_.valid_data, idx);
             }
         } else {
-            ARROW_RETURN_NOT_OK(b_crossed_->Append(false));
-            ARROW_RETURN_NOT_OK(b_spread_->AppendNull());
-            ARROW_RETURN_NOT_OK(b_mid_px2_->AppendNull());
+            clear_valid(spread_.valid_data, idx);
+            clear_valid(mid_px2_.valid_data, idx);
         }
 
+        set_bool(crossed_.bits, idx, crossed);
+
         ++rows_in_part_;
-        if (rows_in_part_ >= cfg_.rows_per_part) return flush_part();
+        if (rows_in_part_ >= cfg_.rows_per_part) {
+            return flush_part();
+        }
+
         return arrow::Status::OK();
     }
 
@@ -155,52 +184,70 @@ public:
     }
 
 private:
-    using MidPx2_t = uint64_t;
+    using MidPx2_t = Price_t;
 
-    void reset_builders() {
-        b_ts_     = make_numeric_builder<Time_t>(pool_);
-        b_seq_    = make_numeric_builder<Id_t>(pool_);
-        b_bb_     = make_numeric_builder<Price_t>(pool_);
-        b_ba_     = make_numeric_builder<Price_t>(pool_);
-        b_bb_vol_ = make_numeric_builder<Volume_t>(pool_);
-        b_ba_vol_ = make_numeric_builder<Volume_t>(pool_);
-
-        b_valid_   = std::make_unique<arrow::BooleanBuilder>(pool_);
-        b_crossed_ = std::make_unique<arrow::BooleanBuilder>(pool_);
-        b_spread_  = std::make_unique<arrow::Int32Builder>(pool_);
-        b_mid_px2_ = make_numeric_builder<MidPx2_t>(pool_);
-
-        const int64_t r = cfg_.rows_per_part;
-        (void)b_ts_->Reserve(r);
-        (void)b_seq_->Reserve(r);
-        (void)b_bb_->Reserve(r);
-        (void)b_ba_->Reserve(r);
-        (void)b_bb_vol_->Reserve(r);
-        (void)b_ba_vol_->Reserve(r);
-        (void)b_valid_->Reserve(r);
-        (void)b_crossed_->Reserve(r);
-        (void)b_spread_->Reserve(r);
-        (void)b_mid_px2_->Reserve(r);
-
-        rows_in_part_ = 0;
+    static inline void set_valid(uint8_t* bitmap, int64_t i) {
+        bitmap[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
+    }
+    static inline void clear_valid(uint8_t* bitmap, int64_t i) {
+        bitmap[i >> 3] &= static_cast<uint8_t>(~(1u << (i & 7)));
     }
 
-    arrow::Result<std::shared_ptr<arrow::Table>> finish_table() {
-        std::shared_ptr<arrow::Array> a_ts, a_seq, a_bb, a_ba, a_bb_vol, a_ba_vol;
-        std::shared_ptr<arrow::Array> a_valid, a_crossed, a_spread, a_mid_px2;
+    static inline int64_t bitmap_nbytes(int64_t nbits) {
+        return (nbits + 7) / 8;
+    }
 
-        ARROW_RETURN_NOT_OK(b_ts_->Finish(&a_ts));
-        ARROW_RETURN_NOT_OK(b_seq_->Finish(&a_seq));
-        ARROW_RETURN_NOT_OK(b_bb_->Finish(&a_bb));
-        ARROW_RETURN_NOT_OK(b_ba_->Finish(&a_ba));
-        ARROW_RETURN_NOT_OK(b_bb_vol_->Finish(&a_bb_vol));
-        ARROW_RETURN_NOT_OK(b_ba_vol_->Finish(&a_ba_vol));
-        ARROW_RETURN_NOT_OK(b_valid_->Finish(&a_valid));
-        ARROW_RETURN_NOT_OK(b_crossed_->Finish(&a_crossed));
-        ARROW_RETURN_NOT_OK(b_spread_->Finish(&a_spread));
-        ARROW_RETURN_NOT_OK(b_mid_px2_->Finish(&a_mid_px2));
+    template <typename T>
+    struct Col {
+        using U = underlying_or_self_t<T>;
+        std::shared_ptr<arrow::Buffer> values;
+        U* data = nullptr;
+        std::shared_ptr<arrow::Buffer> valid;
+        uint8_t* valid_data = nullptr;
+    };
 
-        auto schema = arrow::schema({
+    template <typename T>
+    arrow::Result<Col<T>> alloc_col(int64_t cap_rows, bool nullable) {
+        using U = underlying_or_self_t<T>;
+        static_assert(std::is_integral_v<U>, "BookStateWriter requires integral/enum types");
+
+        Col<T> c;
+
+        ARROW_ASSIGN_OR_RAISE(c.values,
+                              arrow::AllocateBuffer(cap_rows * static_cast<int64_t>(sizeof(U)), pool_));
+        c.data = reinterpret_cast<U*>(c.values->mutable_data());
+
+        if (nullable) {
+            ARROW_ASSIGN_OR_RAISE(c.valid, arrow::AllocateBuffer(bitmap_nbytes(cap_rows), pool_));
+            c.valid_data = c.valid->mutable_data();
+            std::memset(c.valid_data, 0, static_cast<size_t>(c.valid->size()));
+        }
+
+        return c;
+    }
+
+    struct BoolCol {
+        std::shared_ptr<arrow::Buffer> values; // bitmap
+        uint8_t* bits = nullptr;
+    };
+
+    arrow::Result<BoolCol> alloc_bool_col(int64_t cap_rows) {
+        BoolCol c;
+        ARROW_ASSIGN_OR_RAISE(c.values, arrow::AllocateBuffer(bitmap_nbytes(cap_rows), pool_));
+        c.bits = c.values->mutable_data();
+        std::memset(c.bits, 0, static_cast<size_t>(c.values->size()));
+        return c;
+    }
+
+    static inline void set_bool(uint8_t* bits, int64_t i, bool v) {
+        const uint8_t mask = static_cast<uint8_t>(1u << (i & 7));
+        uint8_t& byte = bits[i >> 3];
+        if (v) byte |= mask;
+        else   byte &= static_cast<uint8_t>(~mask);
+    }
+
+    void init_schema() {
+        schema_ = arrow::schema({
             arrow::field("timestamp",        arrow_type_for<Time_t>(),  false),
             arrow::field("sequence_number",  arrow_type_for<Id_t>(),    false),
 
@@ -216,21 +263,63 @@ private:
             arrow::field("spread_ticks",     arrow::int32(),   true),
             arrow::field("mid_px2_ticks",    arrow_type_for<MidPx2_t>(), true),
         });
+    }
 
-        std::vector<std::shared_ptr<arrow::ChunkedArray>> cols;
+    void reset_part_storage() {
+        const int64_t cap = cfg_.rows_per_part;
+
+        ts_     = alloc_col<Time_t>(cap, /*nullable=*/false).ValueOrDie();
+        seq_    = alloc_col<Id_t>(cap,   /*nullable=*/false).ValueOrDie();
+        bb_     = alloc_col<Price_t>(cap,/*nullable=*/true).ValueOrDie();
+        ba_     = alloc_col<Price_t>(cap,/*nullable=*/true).ValueOrDie();
+        bb_vol_ = alloc_col<Volume_t>(cap,/*nullable=*/false).ValueOrDie();
+        ba_vol_ = alloc_col<Volume_t>(cap,/*nullable=*/false).ValueOrDie();
+        spread_ = alloc_col<int32_t>(cap, /*nullable=*/true).ValueOrDie();
+        mid_px2_= alloc_col<MidPx2_t>(cap,/*nullable=*/true).ValueOrDie();
+
+        valid_   = alloc_bool_col(cap).ValueOrDie();
+        crossed_ = alloc_bool_col(cap).ValueOrDie();
+
+        rows_in_part_ = 0;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::Table>> finish_table() {
+        const int64_t n = rows_in_part_;
+
+        auto make_prim = [&](auto& col, const std::shared_ptr<arrow::DataType>& dt, bool nullable) {
+            std::vector<std::shared_ptr<arrow::Buffer>> bufs;
+            bufs.reserve(2);
+            if (nullable) {
+                bufs.push_back(col.valid);
+            } else {
+                bufs.push_back(nullptr);
+            }
+            bufs.push_back(col.values);
+
+            auto ad = arrow::ArrayData::Make(dt, n, std::move(bufs), /*null_count=*/-1);
+            return arrow::MakeArray(ad);
+        };
+
+        auto make_bool = [&](const BoolCol& b) {
+            auto ad = arrow::ArrayData::Make(arrow::boolean(), n, {nullptr, b.values}, /*null_count=*/0);
+            return arrow::MakeArray(ad);
+        };
+
+        std::vector<std::shared_ptr<arrow::Array>> cols;
         cols.reserve(10);
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_ts));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_seq));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_bb));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_ba));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_bb_vol));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_ba_vol));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_valid));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_crossed));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_spread));
-        cols.push_back(std::make_shared<arrow::ChunkedArray>(a_mid_px2));
 
-        return arrow::Table::Make(schema, std::move(cols));
+        cols.push_back(make_prim(ts_,      arrow_type_for<Time_t>(),   false));
+        cols.push_back(make_prim(seq_,     arrow_type_for<Id_t>(),     false));
+        cols.push_back(make_prim(bb_,      arrow_type_for<Price_t>(),  true));
+        cols.push_back(make_prim(ba_,      arrow_type_for<Price_t>(),  true));
+        cols.push_back(make_prim(bb_vol_,  arrow_type_for<Volume_t>(), false));
+        cols.push_back(make_prim(ba_vol_,  arrow_type_for<Volume_t>(), false));
+        cols.push_back(make_bool(valid_));
+        cols.push_back(make_bool(crossed_));
+        cols.push_back(make_prim(spread_,  arrow::int32(),             true));
+        cols.push_back(make_prim(mid_px2_, arrow_type_for<MidPx2_t>(), true));
+
+        return arrow::Table::Make(schema_, std::move(cols));
     }
 
     arrow::Status flush_part() {
@@ -247,10 +336,12 @@ private:
         props_builder.compression(cfg_.compression);
         auto props = props_builder.build();
 
-        const int64_t rg = std::max<int64_t>(1, cfg_.row_group_size);
-        ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(*table, pool_, sink, rg, props));
+        ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(*table, pool_, sink, cfg_.row_group_size, props));
 
-        reset_builders();
+        std::cout << "Wrote " << out_file.string()
+                  << " rows=" << rows_in_part_ << "\n";
+
+        reset_part_storage();
         return arrow::Status::OK();
     }
 
@@ -259,21 +350,23 @@ private:
     Config cfg_;
     arrow::MemoryPool* pool_{nullptr};
 
+    std::shared_ptr<arrow::Schema> schema_;
     int part_idx_ = 0;
     int64_t rows_in_part_ = 0;
 
-    std::unique_ptr<arrow::ArrayBuilder> b_ts_;
-    std::unique_ptr<arrow::ArrayBuilder> b_seq_;
-    std::unique_ptr<arrow::ArrayBuilder> b_bb_;
-    std::unique_ptr<arrow::ArrayBuilder> b_ba_;
-    std::unique_ptr<arrow::ArrayBuilder> b_bb_vol_;
-    std::unique_ptr<arrow::ArrayBuilder> b_ba_vol_;
+    Col<Time_t>   ts_;
+    Col<Id_t>     seq_;
+    Col<Price_t>  bb_;
+    Col<Price_t>  ba_;
+    Col<Volume_t> bb_vol_;
+    Col<Volume_t> ba_vol_;
+    Col<int32_t>  spread_;
+    Col<MidPx2_t> mid_px2_;
 
-    std::unique_ptr<arrow::BooleanBuilder> b_valid_;
-    std::unique_ptr<arrow::BooleanBuilder> b_crossed_;
-    std::unique_ptr<arrow::Int32Builder>   b_spread_;
-    std::unique_ptr<arrow::ArrayBuilder>   b_mid_px2_;
+    BoolCol valid_;
+    BoolCol crossed_;
 };
+
 
 inline arrow::Status replay_plu_bin_to_parquet(
     const fs::path& plu_bin_path,
@@ -309,25 +402,26 @@ inline arrow::Status replay_plu_bin_to_parquet(
                  static_cast<std::streamsize>(to_read * sizeof(PayloadPriceLevelUpdate)));
         if (!ifs) return arrow::Status::IOError("Read error while streaming PLU file");
 
-        // IMPORTANT: iterate only over records actually read
         for (int64_t i = 0; i < to_read; ++i) {
-            auto& u = buf[static_cast<size_t>(i)];
-
+            const auto& u = buf[static_cast<size_t>(i)];
             book.on_price_level_update(&u);
 
-            const auto bb = book.best_bid_price();
-            const auto ba = book.best_ask_price();
+            const auto bb = book.best_bid(); // {price, vol}
+            const auto ba = book.best_ask(); // {price, vol}
 
+            std::optional<Price_t> bbp;
+            std::optional<Price_t> bap;
             Volume_t bbv = 0;
             Volume_t bav = 0;
-            if (bb) bbv = book.volume_at(Side::BUY, *bb);
-            if (ba) bav = book.volume_at(Side::SELL, *ba);
+
+            if (bb) { bbp = bb->first; bbv = bb->second; }
+            if (ba) { bap = ba->first; bav = ba->second; }
 
             ARROW_RETURN_NOT_OK(writer.append(
                 u.timestamp,
                 u.sequence_number,
-                bb,
-                ba,
+                bbp,
+                bap,
                 bbv,
                 bav));
         }

@@ -30,7 +30,7 @@ std::shared_ptr<arrow::DataType> arrow_type_for() {
     if constexpr (sz == 4) return signed_ ? arrow::int32() : arrow::uint32();
     if constexpr (sz == 8) return signed_ ? arrow::int64() : arrow::uint64();
 
-    return arrow::binary();
+    return arrow::binary(); // should never happen
 }
 
 template <typename T>
@@ -47,17 +47,30 @@ static arrow::Result<PrimitiveArrayOut<T>> make_primitive_array_out(
 {
     using U = underlying_or_self_t<T>;
     static_assert(std::is_integral_v<U>, "integral/enum only");
-    static_assert(std::is_unsigned_v<U>, "make_primitive_array_out assumes unsigned values");
 
     if (length < 0) return arrow::Status::Invalid("Negative length");
 
-    ARROW_ASSIGN_OR_RAISE(auto values, arrow::AllocateBuffer(length * static_cast<int64_t>(sizeof(U)), pool));
+    // AllocateBuffer returns shared_ptr<Buffer> in Arrow's C++ API.
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
+                          arrow::AllocateBuffer(length * static_cast<int64_t>(sizeof(U)), pool));
 
-    auto data = arrow::ArrayData::Make(arrow_type_for<U>(), length, {nullptr, values});
+    // Get writable pointer now; values will be kept alive via ArrayData buffers.
+    U* data_ptr = reinterpret_cast<U*>(values->mutable_data());
+
+    std::vector<std::shared_ptr<arrow::Buffer>> bufs;
+    bufs.reserve(2);
+    bufs.emplace_back(std::shared_ptr<arrow::Buffer>{}); // validity bitmap: none
+    bufs.push_back(values);                               // values buffer
+
+    // This overload exists in many Arrow versions; if yours differs, see note below.
+    auto ad = arrow::ArrayData::Make(arrow_type_for<U>(),
+                                     length,
+                                     std::move(bufs),
+                                     /*null_count=*/0);
 
     PrimitiveArrayOut<T> out;
-    out.array = arrow::MakeArray(data);
-    out.data = reinterpret_cast<U*>(values->mutable_data());
+    out.array = arrow::MakeArray(ad);
+    out.data  = data_ptr;
     return out;
 }
 
