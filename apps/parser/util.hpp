@@ -20,7 +20,18 @@ using underlying_or_self_t = typename underlying_or_self<T>::type;
 template <typename T>
 std::shared_ptr<arrow::DataType> arrow_type_for() {
     using U = underlying_or_self_t<T>;
-    static_assert(std::is_integral_v<U>, "Only integral/enum types supported");
+    static_assert(
+        std::is_integral_v<U> || std::is_floating_point_v<U>,
+        "Only integral/enum and floating-point types supported");
+        
+    if constexpr (std::is_floating_point_v<U>) {
+        if constexpr (std::is_same_v<U, float>)  return arrow::float32();
+        if constexpr (std::is_same_v<U, double>) return arrow::float64();
+
+        // Arrow doesn't have a native long double type; fail loudly.
+        static_assert(!std::is_same_v<U, long double>,
+                      "long double is not supported by Arrow; use double instead");
+    }
 
     constexpr bool signed_ = std::is_signed_v<U>;
     constexpr size_t sz = sizeof(U);
@@ -46,7 +57,9 @@ static arrow::Result<PrimitiveArrayOut<T>> make_primitive_array_out(
     arrow::MemoryPool* pool = arrow::default_memory_pool())
 {
     using U = underlying_or_self_t<T>;
-    static_assert(std::is_integral_v<U>, "integral/enum only");
+    static_assert(
+    std::is_arithmetic_v<U> || std::is_enum_v<U>,
+    "PrimitiveArrayOut requires arithmetic or enum types");
 
     if (length < 0) return arrow::Status::Invalid("Negative length");
 
@@ -63,10 +76,7 @@ static arrow::Result<PrimitiveArrayOut<T>> make_primitive_array_out(
     bufs.push_back(values);                               // values buffer
 
     // This overload exists in many Arrow versions; if yours differs, see note below.
-    auto ad = arrow::ArrayData::Make(arrow_type_for<U>(),
-                                     length,
-                                     std::move(bufs),
-                                     /*null_count=*/0);
+    auto ad = arrow::ArrayData::Make(arrow_type_for<U>(), length, std::move(bufs), /*null_count=*/0);
 
     PrimitiveArrayOut<T> out;
     out.array = arrow::MakeArray(ad);

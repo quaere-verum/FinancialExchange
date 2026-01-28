@@ -15,7 +15,9 @@
 #include <string>
 #include <thread>
 #include <algorithm>
+#include <filesystem>
 
+namespace fs = std::filesystem;
 // ------------------------------------------------------------
 // Filenames
 // ------------------------------------------------------------
@@ -48,17 +50,11 @@ inline std::string message_type_to_string(MessageType t) {
     }
 }
 
-inline std::string make_typed_filename(
-    const std::string& dir,
-    const std::string& base_ts,
+inline fs::path make_typed_path(
+    const fs::path& run_dir,
     MessageType type
 ) {
-    std::ostringstream oss;
-    oss << dir << "/"
-        << base_ts << "_"
-        << message_type_to_string(type)
-        << ".bin";
-    return oss.str();
+    return run_dir / (message_type_to_string(type) + ".bin");
 }
 
 constexpr size_t MAX_LOGGED_SIZE = []() {
@@ -74,23 +70,21 @@ constexpr size_t MAX_LOGGED_SIZE = []() {
     return m;
 }();
 
-// ------------------------------------------------------------
-// Logger
-// ------------------------------------------------------------
-//
-// Design:
-// - One file per message type, payload-only (no per-message header).
-// - One SPSCQueue per message type, with a fixed-size item buffer sized
-//   to the maximum payload size among the known logged message types.
-//   Only the first payload_size_for_type(type) bytes are written.
-// - Single writer thread drains all queues and flushes per-type staging buffers.
-//
 class BinaryEventLogger {
     public:
         explicit BinaryEventLogger(const std::string& dir)
             : dir_(dir),
             base_ts_(make_timestamp_string()),
+            run_dir_(fs::path(dir_) / base_ts_),
             running_(true) {
+
+            std::error_code ec;
+            fs::create_directories(run_dir_, ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "Failed to create log directory: " + run_dir_.string() + " (" + ec.message() + ")"
+                );
+            }
 
             open_sink_(MessageType::PRICE_LEVEL_UPDATE, sink_plu_);
             open_sink_(MessageType::TRADE_EVENT,        sink_trade_);
@@ -275,10 +269,10 @@ class BinaryEventLogger {
         }
 
         void open_sink_(MessageType type, FileSink& sink) {
-            const std::string filename = make_typed_filename(dir_, base_ts_, type);
+            const fs::path path = make_typed_path(run_dir_, type);
 
             sink.file = ::CreateFileA(
-                filename.c_str(),
+                path.string().c_str(),
                 GENERIC_WRITE,
                 FILE_SHARE_READ,
                 nullptr,
@@ -288,12 +282,12 @@ class BinaryEventLogger {
             );
 
             if (sink.file == INVALID_HANDLE_VALUE) {
-                throw std::runtime_error("Failed to open binary log file: " + filename);
+                throw std::runtime_error("Failed to open binary log file: " + path.string());
             }
 
             sink.payload_size = payload_size_for_type(type);
             if (sink.payload_size > MAX_LOGGED_SIZE) {
-                throw std::runtime_error("Payload size exceeds MAX_LOGGED_SIZE for type: " + filename);
+                throw std::runtime_error("Payload size exceeds MAX_LOGGED_SIZE for type: " + path.string());
             }
 
             sink.opened = true;
@@ -339,6 +333,7 @@ class BinaryEventLogger {
     private:
         std::string dir_;
         std::string base_ts_;
+        fs::path run_dir_;
 
         std::atomic<bool> running_{false};
         std::thread writer_;

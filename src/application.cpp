@@ -2,12 +2,12 @@
 #include <iostream>
 #include <stdio.h>
 
-Application::Application(uint16_t port, size_t num_threads)
+Application::Application(uint16_t port, size_t num_threads, bool log_all)
     : io_context_(),
     signals_(io_context_, SIGINT, SIGTERM),
     port_(port) {
         work_guard_.emplace(io_context_.get_executor());
-        exchange_ = std::make_unique<Exchange>(io_context_, port);
+        exchange_ = std::make_unique<Exchange>(io_context_, port, log_all);
         threads_.reserve(num_threads);
         signals_.async_wait(
             [this](const boost::system::error_code&, int) {

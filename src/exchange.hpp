@@ -26,7 +26,7 @@ class Exchange final : public OrderBookCallbacks {
     public:
         using tcp = boost::asio::ip::tcp;
 
-        Exchange(boost::asio::io_context& context, uint16_t port);
+        Exchange(boost::asio::io_context& context, uint16_t port, bool log_all);
         ~Exchange();
 
         void start();
@@ -95,6 +95,8 @@ class Exchange final : public OrderBookCallbacks {
         Id_t next_connection_id_{0};
         Id_t trade_id_{0};
         Id_t sequence_number_{0};
+
+        bool log_all_;
 
         BinaryEventLogger event_logger_;
 };

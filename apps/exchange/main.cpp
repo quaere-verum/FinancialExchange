@@ -18,6 +18,7 @@ int main(int argc, char* argv[]) {
         );
         uint16_t port = 16000;
         std::size_t io_threads = 1;
+        bool log_all = false;
 
         if (argc > 1) {
             int p = std::atoi(argv[1]);
@@ -37,7 +38,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        Application app(port, io_threads);
+        Application app(port, io_threads, log_all);
         app.start();
         app.wait();
 

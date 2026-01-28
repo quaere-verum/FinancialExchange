@@ -24,18 +24,29 @@ int main(int argc, char** argv) {
 
     fs::path run_out = out_dir / run_prefix;
 
-    auto in_trade  = log_dir / (run_prefix + "_trade.bin");
-    auto in_plu    = log_dir / (run_prefix + "_price_level_update.bin");
-    auto in_ins    = log_dir / (run_prefix + "_insert_order.bin");
-    auto in_can    = log_dir / (run_prefix + "_cancel_order.bin");
-    auto in_amend  = log_dir / (run_prefix + "_amend_order.bin");
+    std::error_code ec;
+    fs::create_directories(run_out, ec);
+    if (ec) {
+        std::cerr << "Failed to create output directory: "
+                << run_out << " (" << ec.message() << ")\n";
+        return 1;
+    }
+
+    auto in_trade  = log_dir / run_prefix / "trade.bin";
+    auto in_plu    = log_dir / run_prefix / "price_level_update.bin";
+    auto in_ins    = log_dir / run_prefix / "insert_order.bin";
+    auto in_can    = log_dir / run_prefix / "cancel_order.bin";
+    auto in_amend  = log_dir / run_prefix / "amend_order.bin";
 
     arrow::Status st;
 
     if (fs::exists(in_trade)) {
+        TradeToTableWithTimeEwmaStats to_table(/*tau_sign=*/3.0, /*tau_volume=*/2.0, /*tau_variance=*/1.0, /*tick_seconds=*/1e-9);
         st = export_one_kind<PayloadTradeEvent>(
-            in_trade, run_out / "trade", batch_rows, trade_block_to_table);
+            in_trade, run_out / "trade", batch_rows, to_table);
         if (!st.ok()) { std::cerr << st.ToString() << "\n"; return 1; }
+    } else {
+        std::cout << "Could not find" << in_trade.string() << ", skipping trades.\n";
     }
 
     if (fs::exists(in_plu)) {
@@ -45,24 +56,32 @@ int main(int argc, char** argv) {
         
         st = replay_book::replay_plu_bin_to_parquet(in_plu, run_out / "order_book_stats");
         if (!st.ok()) { std::cerr << st.ToString() << "\n"; return 1; }
+    } else {
+        std::cout << "Could not find" << in_plu.string() << ", skipping price level updates.\n";
     }
 
     if (fs::exists(in_ins)) {
         st = export_one_kind<PayloadOrderInsertedEvent>(
             in_ins, run_out / "order_inserted", batch_rows, insert_block_to_table);
         if (!st.ok()) { std::cerr << st.ToString() << "\n"; return 1; }
+    } else {
+        std::cout << "Could not find" << in_ins.string() << ", skipping inserts.\n";
     }
 
     if (fs::exists(in_can)) {
         st = export_one_kind<PayloadOrderCancelledEvent>(
             in_can, run_out / "order_cancelled", batch_rows, cancel_block_to_table);
         if (!st.ok()) { std::cerr << st.ToString() << "\n"; return 1; }
+    } else {
+        std::cout << "Could not find" << in_can.string() << ", skipping cancels.\n";
     }
 
     if (fs::exists(in_amend)) {
         st = export_one_kind<PayloadOrderAmendedEvent>(
             in_amend, run_out / "order_amended", batch_rows, amend_block_to_table);
         if (!st.ok()) { std::cerr << st.ToString() << "\n"; return 1; }
+    } else {
+        std::cout << "Could not find" << in_amend.string() << ", skipping amends.\n";
     }
 
     std::cout << "Done.\n";

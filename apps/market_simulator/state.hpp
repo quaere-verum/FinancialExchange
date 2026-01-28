@@ -5,6 +5,8 @@
 enum class LatentModel {GBM, OU};
 
 inline constexpr LatentModel latent_model = LatentModel::GBM;
+constexpr double INITIAL_FAIR_VALUE = 1'000.0;
+constexpr double INITIAL_LOG_FAIR_VALUE = 6.907755278982137; // log(1000)
 
 struct TimeState {
     double sim_time;
@@ -27,6 +29,7 @@ struct PriceState {
 
 template<size_t N>
 struct LiquidityState {
+    static_assert(N > 0, "LiquidityState<N>: N must be greater than 0");
     std::array<Price_t, N> bucket_bounds;
 
     std::array<Volume_t, N> bid_volumes;
@@ -69,11 +72,12 @@ struct FlowState {
     double flow_imbalance = 0.0;
     double taker_sign_ewma = 0.0;
     double trade_excitation = 0.0;
+    double trade_pressure_fast = 0.0;
 };
 
 struct LatentState {
-    double fair_value = 1000.0;
-    double log_fair_value = std::log(1000.0);
+    double fair_value = INITIAL_FAIR_VALUE;
+    double log_fair_value = INITIAL_LOG_FAIR_VALUE;
     double time_since_update = 0.0;
 };
 
@@ -255,7 +259,7 @@ class SimulationState {
 
                 if constexpr (latent_model == LatentModel::OU) {
                     constexpr double kappa  = 0.05;
-                    constexpr double mu_log = 6.907755278982137; // log(1000)
+                    constexpr double mu_log = INITIAL_LOG_FAIR_VALUE; // log(1000)
 
                     latent_state_.log_fair_value +=
                         kappa * (mu_log - latent_state_.log_fair_value) * latent_dt
@@ -273,7 +277,8 @@ class SimulationState {
             }
         }
 
-
+        inline void update_latent_state_on_trade(const PayloadTradeEvent* trade, double dt) {
+        }
 
 
         inline void update_vol_state(const PayloadTradeEvent* trade, double dt) {
@@ -325,10 +330,11 @@ class SimulationState {
             FlowState& fs = flow_state_;
 
             const double vol = static_cast<double>(trade->quantity);
-            const double a_flow = 1.0 - std::exp(-dt / TAU_FLOW);
-            const double a_rate = 1.0 - std::exp(-dt / TAU_RATE);
-            const double a_surp = 1.0 - std::exp(-dt / TAU_SURPRISE);
-            const double a_sign = 1.0 - std::exp(-dt / TAU_SIGN);
+            const double a_flow  = 1.0 - std::exp(-dt / TAU_FLOW);
+            const double a_rate  = 1.0 - std::exp(-dt / TAU_RATE);
+            const double a_surp  = 1.0 - std::exp(-dt / TAU_SURPRISE);
+            const double a_sign  = 1.0 - std::exp(-dt / TAU_SIGN);
+            const double a_press = 1.0 - std::exp(-dt / TAU_PRESSURE);
 
             fs.abs_volume_ewma = (1.0 - a_flow) * fs.abs_volume_ewma + a_flow * vol;
 
@@ -356,6 +362,13 @@ class SimulationState {
             const double sign = (trade->taker_side == Side::BUY ? 1.0 : -1.0);
             fs.taker_sign_ewma = (1.0 - a_sign) * fs.taker_sign_ewma + a_sign * sign;
             fs.taker_sign_ewma = std::clamp(fs.taker_sign_ewma, -1.0, 1.0);
+
+            const double q = static_cast<double>(trade->quantity);
+            const double s = (trade->taker_side == Side::BUY ? 1.0 : -1.0);
+            const double impulse = s * std::tanh(0.15 * std::sqrt(q));
+            fs.trade_pressure_fast = (1.0 - a_press) * fs.trade_pressure_fast + a_press * impulse;
+
+            fs.trade_pressure_fast = std::clamp(fs.trade_pressure_fast, -1.0, 1.0);
         }
 
         inline void bump_trade_excitation(const PayloadTradeEvent* trade) {
@@ -383,7 +396,7 @@ class SimulationState {
         // Update later to be more general
         PCGRNG rng_;
 
-        Price_t last_trade_price_ = 0;
+        Price_t last_trade_price_ = static_cast<Price_t>(INITIAL_FAIR_VALUE);
         Time_t last_trade_timestamp_ = 0;
 
         std::array<double, N> bid_w_{}, bid_x_{}, bid_x2_{}, bid_x3_{};
@@ -398,6 +411,7 @@ class SimulationState {
         static constexpr double TAU_SURPRISE = 10.0;
         static constexpr double TAU_SIGN   = 3.0;
         static constexpr double TAU_EXCITE = 2.0;
+        static constexpr double TAU_PRESSURE = 0.15;
 
 
         static constexpr double VOL_MIN = 1e-6;

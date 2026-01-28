@@ -141,7 +141,7 @@ public:
         // ------------------------------------------------------------
         // 4) Price formation (anchor + regime-specific placement)
         // ------------------------------------------------------------
-        const Price_t anchor = compute_anchor_(ps, ls, side, rng);
+        const Price_t anchor = compute_anchor_(ps, ls, liq, rng);
 
         Price_t price = anchor;
         double dist = 0.0;
@@ -361,29 +361,52 @@ private:
         return AgentType::NOISE;
     }
 
-    static inline Price_t compute_anchor_(const PriceState& ps, const LatentState& ls, Side side, RNG* rng) {
-        constexpr double best_w = 0.65;
-        constexpr double fv_w   = 0.35;
+    template <std::size_t N>
+    static inline Price_t compute_anchor_(
+        const PriceState& ps,
+        const LatentState& ls,
+        const LiquidityState<N>& liquidity_state,
+        RNG* rng
+    ) {
+        constexpr double mid_w = 0.65;
+        constexpr double fv_w  = 0.35;
 
         const double fv = ls.fair_value;
-        const double last = static_cast<double>(ps.last_trade_price);
 
-        if (side == Side::BUY) {
-            if (ps.best_bid) {
-                const double a = best_w * static_cast<double>(*ps.best_bid) + fv_w * fv;
-                return static_cast<Price_t>(std::max(MINIMUM_BID, stochastic_round(a, rng)));
+        double anchor_base;
+
+        if (ps.best_bid && ps.best_ask) {
+            const auto bid_vol = static_cast<double>(liquidity_state.bid_volumes[0]);
+            const auto ask_vol = static_cast<double>(liquidity_state.ask_volumes[0]);
+
+            if (bid_vol + ask_vol > 0.0) {
+                // Microprice
+                anchor_base =
+                    (bid_vol * static_cast<double>(*ps.best_bid) +
+                    ask_vol * static_cast<double>(*ps.best_ask))
+                    / (bid_vol + ask_vol);
+            } else {
+                // Zero-volume edge case: fall back to mid
+                anchor_base =
+                    0.5 * (static_cast<double>(*ps.best_bid) +
+                        static_cast<double>(*ps.best_ask));
             }
-            const double a = best_w * last + fv_w * fv;
-            return static_cast<Price_t>(std::max(MINIMUM_BID, stochastic_round(a, rng)));
+        } else if (ps.last_trade_price > 0) {
+            anchor_base = static_cast<double>(ps.last_trade_price);
         } else {
-            if (ps.best_ask) {
-                const double a = best_w * static_cast<double>(*ps.best_ask) + fv_w * fv;
-                return static_cast<Price_t>(std::max(MINIMUM_BID, stochastic_round(a, rng)));
-            }
-            const double a = best_w * last + fv_w * fv;
-            return static_cast<Price_t>(std::max(MINIMUM_BID, stochastic_round(a, rng)));
+            // Ultimate fallback
+            anchor_base = fv;
         }
+
+        const double a = mid_w * anchor_base + fv_w * fv;
+
+        return static_cast<Price_t>(
+            std::clamp(stochastic_round(a, rng), MINIMUM_BID, MAXIMUM_ASK)
+        );
     }
+
+
+
 
     static inline Volume_t apply_lot_clustering_(RNG* rng, Volume_t q) {
         double u = rng->standard_uniform();

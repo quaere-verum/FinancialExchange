@@ -8,11 +8,12 @@
 
 TG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_CON, "CON")
 
-Exchange::Exchange(boost::asio::io_context& context, uint16_t port)
+Exchange::Exchange(boost::asio::io_context& context, uint16_t port, bool log_all)
     : context_(context)
     , accept_strand_(context_.get_executor())
     , engine_strand_(context_.get_executor())
     , acceptor_(context_, tcp::endpoint(tcp::v4(), port))
+    , log_all_(log_all)
     , event_logger_("logs") 
     {
         order_book_.set_callbacks(this);
@@ -314,7 +315,7 @@ void Exchange::on_order_inserted(Id_t client_request_id, const Order& order, Tim
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_INSERTED_EVENT), &insert_message);
-    event_logger_.log_message(MessageType::ORDER_INSERTED_EVENT, &insert_message);
+    if (log_all_) event_logger_.log_message(MessageType::ORDER_INSERTED_EVENT, &insert_message);
 }
 
 void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Time_t timestamp) {
@@ -339,7 +340,7 @@ void Exchange::on_order_cancelled(Id_t client_request_id, const Order& order, Ti
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_CANCELLED_EVENT), &cancel_message);
-    event_logger_.log_message(MessageType::ORDER_CANCELLED_EVENT, &cancel_message);
+    if (log_all_) event_logger_.log_message(MessageType::ORDER_CANCELLED_EVENT, &cancel_message);
 }
 
 void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, const Order& order, Time_t timestamp) {
@@ -365,7 +366,7 @@ void Exchange::on_order_amended(Id_t client_request_id, Volume_t quantity_old, c
     );
 
     broadcast_to_subscribers_(static_cast<Message_t>(MessageType::ORDER_AMENDED_EVENT), &amended_message);
-    event_logger_.log_message(MessageType::ORDER_AMENDED_EVENT, &amended_message);
+    if (log_all_) event_logger_.log_message(MessageType::ORDER_AMENDED_EVENT, &amended_message);
 }
 
 void Exchange::on_level_update(Side side, PriceLevel const& level, Time_t timestamp) {

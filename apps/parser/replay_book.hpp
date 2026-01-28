@@ -380,8 +380,7 @@ inline arrow::Status replay_plu_bin_to_parquet(
     const int64_t total = count_records_truncating<PayloadPriceLevelUpdate>(plu_bin_path);
     if (total <= 0) return arrow::Status::OK();
 
-    const fs::path out_dir = out_run_dir / "book_state";
-    BookStateWriter writer(out_dir, cfg);
+    BookStateWriter writer(out_run_dir, cfg);
     ShadowOrderBook book(100);
 
     std::ifstream ifs(plu_bin_path, std::ios::binary);

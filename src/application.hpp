@@ -12,7 +12,7 @@
 
 class Application {
     public:
-        explicit Application(uint16_t port, size_t num_threads = 1);
+        explicit Application(uint16_t port, size_t num_threads = 1, bool log_all = false);
 
         void start();
         void stop();
