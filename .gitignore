@@ -6,4 +6,6 @@ logs/
 out/
 .vscode/
 build/
+.temp/
+duckdb_temp/
 __pycache__/

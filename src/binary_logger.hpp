@@ -18,22 +18,6 @@
 #include <filesystem>
 
 namespace fs = std::filesystem;
-// ------------------------------------------------------------
-// Filenames
-// ------------------------------------------------------------
-inline std::string make_timestamp_string() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    localtime_s(&tm, &now_t);
-#else
-    localtime_r(&now_t, &tm);
-#endif
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
-    return oss.str();
-}
 
 inline std::string message_type_to_string(MessageType t) {
     switch (t) {
@@ -48,13 +32,6 @@ inline std::string message_type_to_string(MessageType t) {
             return oss.str();
         }
     }
-}
-
-inline fs::path make_typed_path(
-    const fs::path& run_dir,
-    MessageType type
-) {
-    return run_dir / (message_type_to_string(type) + ".bin");
 }
 
 constexpr size_t MAX_LOGGED_SIZE = []() {
@@ -73,9 +50,7 @@ constexpr size_t MAX_LOGGED_SIZE = []() {
 class BinaryEventLogger {
     public:
         explicit BinaryEventLogger(const std::string& dir)
-            : dir_(dir),
-            base_ts_(make_timestamp_string()),
-            run_dir_(fs::path(dir_) / base_ts_),
+            : run_dir_(fs::path(dir)),
             running_(true) {
 
             std::error_code ec;
@@ -269,7 +244,7 @@ class BinaryEventLogger {
         }
 
         void open_sink_(MessageType type, FileSink& sink) {
-            const fs::path path = make_typed_path(run_dir_, type);
+            const fs::path path = run_dir_ / (message_type_to_string(type) + ".bin");
 
             sink.file = ::CreateFileA(
                 path.string().c_str(),
@@ -331,8 +306,6 @@ class BinaryEventLogger {
         }
 
     private:
-        std::string dir_;
-        std::string base_ts_;
         fs::path run_dir_;
 
         std::atomic<bool> running_{false};

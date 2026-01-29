@@ -371,6 +371,7 @@ private:
 inline arrow::Status replay_plu_bin_to_parquet(
     const fs::path& plu_bin_path,
     const fs::path& out_run_dir,
+    const size_t batch_size,
     const BookStateWriter::Config& cfg = {})
 {
     if (!fs::exists(plu_bin_path)) {
@@ -386,8 +387,7 @@ inline arrow::Status replay_plu_bin_to_parquet(
     std::ifstream ifs(plu_bin_path, std::ios::binary);
     if (!ifs) return arrow::Status::IOError("Failed to open PLU file: ", plu_bin_path.string());
 
-    constexpr int64_t kBlockRecs = 1'000'000;
-    const int64_t buf_cap = std::min<int64_t>(kBlockRecs, total);
+    const int64_t buf_cap = std::min<int64_t>(batch_size, total);
 
     std::vector<PayloadPriceLevelUpdate> buf;
     buf.resize(static_cast<size_t>(buf_cap));
