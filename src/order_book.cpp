@@ -199,7 +199,7 @@ Volume_t OrderBookSide::match_loop(
     std::unordered_map<Id_t, Id_t>& order_id_to_handle
 ) noexcept {
     RLOG(LG_CON, LogLevel::LL_DEBUG) << "[OrderBookSide] Order from " << client_id << " with id=" << order_id 
-    << ", qty=" << incoming_quantity << ", p=" << incoming_price << " entering matching process.";
+    << ", side=" << ((maker_side == Side::BUY) ? "sell" : "buy") << ", qty=" << incoming_quantity << ", p=" << incoming_price << " entering matching process.";
     Time_t now = utc_now_ns();
     Volume_t total_incoming_quantity = incoming_quantity;
     auto* cb = callbacks_;

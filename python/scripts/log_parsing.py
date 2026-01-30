@@ -1,44 +1,67 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import subprocess
+
+import duckdb
 import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
-import subprocess
-import os
 
 
 # -----------------------------
-# User config
+# Granularities per diagnostic
 # -----------------------------
-RUN = "20260127_171744"
+# You can tweak these later without changing the core logic.
+BUCKETS = {
+    # book state / spread shape
+    "spread_dist": ["1ms", "10ms", "100ms"],
+    # clustering / volatility-volume at multiple scales
+    "activity_vs_vol": ["10ms", "100ms", "1s"],
+    # micro impact should stay fine
+    "impact": ["1ms", "10ms"],
+    # persistence depends heavily on sampling; do a couple
+    "flow_persistence": ["10ms", "100ms"],
+    # return dynamics across micro + meso
+    "mid_dynamics": ["1ms", "100ms", "1s"],
+}
 
-# Bucket width: choose based on your sim intensity.
-# 100ms is a good starting point; 1s if still heavy.
-BUCKET = "1ms"
+HORIZONS_BY_BUCKET = {
+    # horizons are in "buckets" (i.e., units of bucket width)
+    # keep small buckets with more lags; coarser buckets with fewer
+    "1ms": [1, 2, 5, 10, 20, 50],
+    "10ms": [1, 2, 5, 10, 20],
+    "100ms": [1, 2, 5, 10],
+    "1s": [1, 2, 5],
+}
 
+MAX_SPREAD_TICKS = 50
+MAX_SHOW_TICKS = 20
+
+ACF_LAGS_FLOW_SIGN = 50  # on bucket sign(flow) series
+
+
+# -----------------------------
+# Time helpers
+# -----------------------------
 def bucket_ns(bucket: str) -> int:
-    # supports "100ms", "1s", "250ms", etc.
     bucket = bucket.strip().lower()
+    if bucket.endswith("ns"):
+        return int(bucket[:-2])
+    if bucket.endswith("μs"):
+        return int(bucket[:-2]) * 1_000
+    if bucket.endswith("us"):
+        return int(bucket[:-2]) * 1_000
     if bucket.endswith("ms"):
         return int(bucket[:-2]) * 1_000_000
     if bucket.endswith("s"):
         return int(bucket[:-1]) * 1_000_000_000
-    raise ValueError(f"Unsupported BUCKET format: {bucket!r}")
-
-BNS = bucket_ns(BUCKET)
-
-# Horizons in buckets (not events)
-HORIZONS = [1, 2, 5, 10, 20, 50]
-
-MAX_SPREAD_TICKS = 50
-MAX_SHOW_TICKS = 20  # for plots
-
-ACF_LAGS_FLOW_SIGN = 50  # ACF on bucket flow sign
+    raise ValueError(f"Unsupported bucket format: {bucket!r}")
 
 
 # -----------------------------
-# Helpers
+# Stats helpers
 # -----------------------------
 def hist_counts_spread(x: np.ndarray, max_tick: int) -> tuple[np.ndarray, int]:
     x = x.astype(np.int64, copy=False)
@@ -66,7 +89,7 @@ def autocorr(x: np.ndarray, max_lag: int) -> np.ndarray:
     if n < max_lag + 2:
         return np.full(max_lag, np.nan)
     x = x - x.mean()
-    denom = np.dot(x, x)
+    denom = float(np.dot(x, x))
     if denom <= 0:
         return np.full(max_lag, np.nan)
     acf = np.empty(max_lag, dtype=np.float64)
@@ -101,187 +124,162 @@ def plot_counts(title: str, counts: np.ndarray, overflow: int, max_spread: int, 
 
 
 # -----------------------------
-# Main
+# DuckDB aggregation
 # -----------------------------
-def main() -> None:
-    if not os.path.isdir(Path("out", RUN, "order_book_stats")):
-        print("PRPROCESSING STARTING")
-        subprocess.run(
-            [
-                Path("build", "apps", "parser", "Parser.exe"),
-                "logs",
-                RUN,
-                "out",
-                str(2_000_000)
-            ]
-        )
-        print("PREPROCESSING DONE")
-    plu_glob = Path("out", RUN, "order_book_stats", "*.parquet")
-    trd_glob = Path("out", RUN, "trade", "*.parquet")
+def bucketed_view(con: duckdb.DuckDBPyConnection, plu_glob: Path, trd_glob: Path, bucket_str: str) -> pl.DataFrame:
+    bns = bucket_ns(bucket_str)
 
-    # ---------- Lazy scans ----------
-    plu = (
-        pl.scan_parquet(str(plu_glob))
-          .select([
-              "timestamp",
-              "sequence_number",
-              "best_bid_price",
-              "best_ask_price",
-              "best_bid_volume",
-              "best_ask_volume",
-              "book_valid",
-              "is_crossed",
-              "spread_ticks",
-              "mid_px2_ticks",
-          ])
+    query = f"""
+    WITH
+    -- Keep ts as UBIGINT (uint64) end-to-end
+    q_range AS (
+        SELECT
+            min(timestamp) AS min_ts,
+            max(timestamp) AS max_ts
+        FROM read_parquet('{plu_glob}')
+    ),
+
+    -- Compute bucket-aligned base and end in UBIGINT
+    bounds AS (
+        SELECT
+            (min_ts // CAST({bns} AS UBIGINT)) * CAST({bns} AS UBIGINT) AS base_ts,
+            ((max_ts // CAST({bns} AS UBIGINT)) + 1) * CAST({bns} AS UBIGINT) AS end_ts
+        FROM q_range
+    ),
+
+    -- Generate boundaries using BIGINT offsets (safe because end_ts-base_ts is small for your window)
+    boundaries AS (
+        SELECT
+            base_ts + CAST(off AS UBIGINT) AS ts,
+            NULL::BIGINT AS spread_ticks,
+            NULL::BIGINT AS mid_px2_ticks,
+            0 AS is_quote
+        FROM bounds,
+             generate_series(
+                0::BIGINT,
+                CAST(CAST(end_ts - base_ts AS HUGEINT) AS BIGINT),
+                CAST({bns} AS BIGINT)
+             ) AS t(off)
+    ),
+
+    quotes AS (
+        SELECT
+            timestamp AS ts,
+            spread_ticks,
+            mid_px2_ticks,
+            1 AS is_quote
+        FROM read_parquet('{plu_glob}')
+    ),
+
+    stream0 AS (
+        SELECT * FROM quotes
+        UNION ALL
+        SELECT * FROM boundaries
+    ),
+
+    -- Group id increments whenever we see a real quote (spread_ticks non-null)
+    stream1 AS (
+        SELECT
+            ts,
+            (ts // CAST({bns} AS UBIGINT)) AS bucket,
+            spread_ticks,
+            mid_px2_ticks,
+            is_quote,
+            SUM(CASE WHEN spread_ticks IS NOT NULL THEN 1 ELSE 0 END)
+                OVER (ORDER BY ts) AS grp
+        FROM stream0
+    ),
+
+    -- Forward-fill via partition max (DuckDB-compatible)
+    stream AS (
+        SELECT
+            ts,
+            bucket,
+            MAX(spread_ticks) OVER (PARTITION BY grp) AS spread_ff,
+            MAX(mid_px2_ticks) OVER (PARTITION BY grp) AS mid_ff,
+            is_quote
+        FROM stream1
+    ),
+
+    -- Durations computed in signed 128-bit so subtraction is safe
+    segments AS (
+        SELECT
+            bucket,
+            ts,
+            spread_ff,
+            mid_ff,
+            is_quote,
+            CAST(LEAD(ts) OVER (ORDER BY ts) AS HUGEINT) - CAST(ts AS HUGEINT) AS duration
+        FROM stream
+    ),
+
+    quote_state_agg AS (
+        SELECT
+            bucket,
+            SUM(spread_ff * duration) / NULLIF(SUM(duration), 0) AS twa_spread,
+            arg_max(mid_ff, ts) / 2.0 AS last_mid
+        FROM segments
+        WHERE duration > 0
+          AND spread_ff IS NOT NULL
+          AND mid_ff IS NOT NULL
+        GROUP BY 1
+    ),
+
+    quote_event_agg AS (
+        SELECT
+            (timestamp // CAST({bns} AS UBIGINT)) AS bucket,
+            COUNT(*) AS n_quote_events
+        FROM read_parquet('{plu_glob}')
+        GROUP BY 1
+    ),
+
+    trade_agg AS (
+        SELECT
+            (timestamp // CAST({bns} AS UBIGINT)) AS bucket,
+            COUNT(*) AS n_trades,
+            SUM(quantity) AS qty_sum,
+            SUM(price * CAST(quantity AS BIGINT)) AS px_qty_sum,
+            SUM(signed_volume) AS flow,
+            arg_max(ewma_variance, timestamp) AS ewma_variance,
+            arg_max(ewma_imbalance, timestamp) AS ewma_imbalance
+        FROM read_parquet('{trd_glob}')
+        GROUP BY 1
     )
 
-    trd = (
-        pl.scan_parquet(str(trd_glob))
-          .select([
-              "timestamp",
-              "sequence_number",
-              "trade_id",
-              "price",
-              "quantity",
-              "taker_side",
-              "signed_volume",
-              "ewma_signed_vol",
-              "ewma_abs_volume",
-              "ewma_imbalance",
-              "ewma_variance",
-          ])
-    )
+    SELECT
+        q.bucket,
+        q.last_mid AS mid,
+        q.twa_spread AS spread,
+        COALESCE(qe.n_quote_events, 0) AS n_quote_events,
+        COALESCE(t.n_trades, 0) AS n_trades,
+        t.px_qty_sum / NULLIF(t.qty_sum, 0) AS vwap,
+        COALESCE(t.flow, 0.0) AS flow,
+        t.ewma_variance,
+        t.ewma_imbalance
+    FROM quote_state_agg q
+    LEFT JOIN quote_event_agg qe ON q.bucket = qe.bucket
+    LEFT JOIN trade_agg t ON q.bucket = t.bucket
+    ORDER BY q.bucket
+    """
 
-    # ---------- Deduplicate on timestamp using max sequence_number ----------
-    def keep_max_seq_per_timestamp(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return lf.sort(["timestamp", "sequence_number"]).group_by("timestamp").tail(1)
-
-    plu_u = keep_max_seq_per_timestamp(plu)
-    trd_u = keep_max_seq_per_timestamp(trd)
-
-    # ---------- Cast ns -> Datetime(ns) and bucket key ----------
-    # This is crucial: group_by_dynamic requires a Datetime/Date column.
-    plu_b = plu_u.with_columns((pl.col("timestamp") // pl.lit(BNS)).alias("bucket"))
-    trd_b = trd_u.with_columns((pl.col("timestamp") // pl.lit(BNS)).alias("bucket"))
-
-    # =============================
-    # 1) Book health (streaming aggregate)
-    # =============================
-    health = (
-        plu_b
-        .select([
-            pl.len().alias("n_quotes"),
-            pl.col("book_valid").sum().alias("n_valid"),
-            pl.col("is_crossed").sum().alias("n_crossed"),
-        ])
-        .collect(engine="streaming")
-    )
-
-    n_quotes = int(health["n_quotes"][0])
-    n_valid = int(health["n_valid"][0])
-    n_cross = int(health["n_crossed"][0])
-
-    print("\n==============================")
-    print("BOOK HEALTH")
-    print("==============================")
-    print(f"Quotes: {n_quotes:,}")
-    print(f"  book_valid=True: {n_valid:,} ({(n_valid / n_quotes) if n_quotes else 0.0:6.2%})")
-    print(f"  is_crossed=True: {n_cross:,} ({(n_cross / n_quotes) if n_quotes else 0.0:6.2%})")
-
-    # =============================
-    # 2) Build bucketed quote series (last observation per bucket)
-    # =============================
-    quotes_b = (
-        plu_b
-        .sort(["bucket", "timestamp", "sequence_number"])
-        .group_by("bucket")
-        .agg([
-            pl.len().alias("n_quote_events"),
-            pl.col("timestamp").last().alias("ts_last"),
-            pl.col("mid_px2_ticks").last().alias("mid_px2"),
-            pl.col("spread_ticks").last().alias("spread"),
-            pl.col("best_bid_price").last().alias("bid"),
-            pl.col("best_ask_price").last().alias("ask"),
-            pl.col("best_bid_volume").last().alias("bid_vol"),
-            pl.col("best_ask_volume").last().alias("ask_vol"),
-            pl.col("book_valid").last().alias("book_valid"),
-            pl.col("is_crossed").last().alias("is_crossed"),
-        ])
-        .sort("bucket")
-    )
-
-    # =============================
-    # 3) Build bucketed trade series (flow + vwap + state)
-    # =============================
-    trades_b = (
-        trd_b
-        .sort(["bucket", "timestamp", "sequence_number"])
-        .group_by("bucket")
-        .agg([
-            pl.len().alias("n_trades"),
-            pl.col("quantity").sum().alias("qty_sum"),
-            (pl.col("price") * pl.col("quantity").cast(pl.Int64)).sum().alias("px_qty_sum"),
-            pl.col("signed_volume").sum().alias("signed_vol_sum"),
-            pl.col("timestamp").last().alias("tr_ts_last"),
-            pl.col("ewma_variance").last().alias("ewma_variance"),
-            pl.col("ewma_imbalance").last().alias("ewma_imbalance"),
-            pl.col("ewma_abs_volume").last().alias("ewma_abs_volume"),
-            pl.col("ewma_signed_vol").last().alias("ewma_signed_vol"),
-        ])
-        .with_columns([
-            (pl.col("px_qty_sum") / pl.when(pl.col("qty_sum") > 0).then(pl.col("qty_sum")).otherwise(None)).alias("vwap"),
-        ])
-        .sort("bucket")
-    )
-
-    # =============================
-    # 4) Join buckets and forward-fill trade state (so each quote bucket has last-known state)
-    # =============================
-    buckets = (
-        quotes_b
-        .join(trades_b, on="bucket", how="left")
-        .with_columns([
+    df = con.execute(query).pl()
+    df = df.with_columns(
+        [
             pl.col("ewma_variance").forward_fill(),
             pl.col("ewma_imbalance").forward_fill(),
-            pl.col("ewma_abs_volume").forward_fill(),
-            pl.col("ewma_signed_vol").forward_fill(),
-            pl.col("n_trades").fill_null(0),
-            pl.col("qty_sum").fill_null(0),
-            pl.col("signed_vol_sum").fill_null(0.0),
-        ])
-        .select([
-            "bucket",
-            "ts_last",
-            "n_quote_events",
-            "mid_px2",
-            "spread",
-            "bid", "ask", "bid_vol", "ask_vol",
-            "book_valid", "is_crossed",
-            "n_trades", "qty_sum", "vwap", "signed_vol_sum",
-            "ewma_variance", "ewma_imbalance", "ewma_abs_volume", "ewma_signed_vol",
-        ])
+        ]
     )
+    return df
 
-    # IMPORTANT: collect only the bucketed result (much smaller than event logs)
-    df = buckets.collect(engine="streaming")
-
-    # Convert to numpy (bucket-level, manageable)
-    spread = df["spread"].to_numpy().astype(np.float64, copy=False)
-    mid = df["mid_px2"].to_numpy().astype(np.float64, copy=False) / 2.0
-    vol = df["ewma_variance"].to_numpy().astype(np.float64, copy=False)
-    imb = df["ewma_imbalance"].to_numpy().astype(np.float64, copy=False)
-    n_trades = df["n_trades"].to_numpy().astype(np.float64, copy=False)
-    n_quotes_b = df["n_quote_events"].to_numpy().astype(np.float64, copy=False)
-    vwap = df["vwap"].to_numpy().astype(np.float64, copy=False)
-    flow = df["signed_vol_sum"].to_numpy().astype(np.float64, copy=False)
+# -----------------------------
+# Per-diagnostic computations
+# -----------------------------
+def run_spread_distribution(df: pl.DataFrame, bucket_str: str) -> None:
+    spread = df["spread"].to_numpy().astype(np.float64)
+    vol = df["ewma_variance"].to_numpy().astype(np.float64)
+    imb = df["ewma_imbalance"].to_numpy().astype(np.float64)
 
     ok_spread = np.isfinite(spread) & (spread >= 0)
-    spread_v = spread[ok_spread].astype(np.int64, copy=False)
-
-    # =============================
-    # 5) Spread distribution + conditional (bucketed decile thresholds)
-    # =============================
     vol_ok = np.isfinite(vol) & ok_spread
     imb_ok = np.isfinite(imb) & ok_spread
 
@@ -297,45 +295,57 @@ def main() -> None:
     counts_imb, over_imb = hist_counts_spread(spread[mask_imb].astype(np.int64, copy=False), MAX_SPREAD_TICKS)
 
     print("\n==============================")
-    print(f"SPREAD DISTRIBUTION (BUCKET={BUCKET})")
+    print(f"SPREAD DISTRIBUTION (bucket={bucket_str})")
     print("==============================")
     print_summary("ALL BUCKETS", counts_all, over_all)
     print_summary("TOP DECILE VOL (bucket ewma_variance)", counts_vol, over_vol)
     print_summary("TOP DECILE |IMB| (bucket ewma_imbalance)", counts_imb, over_imb)
 
-    # =============================
-    # 6) Activity clustering: trades/quotes per bucket vs vol
-    # =============================
+    # Optional plots
+    # plot_counts(f"Spread histogram - ALL (bucket={bucket_str})", counts_all, over_all, MAX_SPREAD_TICKS, MAX_SHOW_TICKS)
+    # plt.show()
+
+
+def run_activity_vs_vol(df: pl.DataFrame, bucket_str: str) -> None:
+    vol = df["ewma_variance"].to_numpy().astype(np.float64)
+    n_trades = df["n_trades"].to_numpy().astype(np.float64)
+    n_quotes_b = df["n_quote_events"].to_numpy().astype(np.float64)
+
+    trade_presence = float(np.mean(n_trades > 0)) if n_trades.size else np.nan
+
     print("\n==============================")
-    print("ACTIVITY vs VOL")
+    print(f"ACTIVITY vs VOL (bucket={bucket_str})")
     print("==============================")
+    print(f"  P(n_trades>0) = {trade_presence: .3f}")
     print(f"  Corr(n_trades, ewma_variance) = {corr_pair(n_trades, vol): .6f}")
     print(f"  Corr(n_quote_events, ewma_variance) = {corr_pair(n_quotes_b, vol): .6f}")
 
-    # =============================
-    # 7) Bucketed response / impact and realized spread proxy
-    # =============================
-    # Response: Δmid at horizon h (in mid units)
-    # Impact proxy: sign(flow) * Δmid
-    # Effective spread proxy: 2*|VWAP - mid| (only buckets with trades)
+
+def run_impact_and_effective_spread(df: pl.DataFrame, bucket_str: str) -> None:
+    mid = df["mid"].to_numpy().astype(np.float64)
+    flow = df["flow"].to_numpy().astype(np.float64)
+    n_trades = df["n_trades"].to_numpy().astype(np.float64)
+    vwap = df["vwap"].to_numpy().astype(np.float64)
+
     print("\n==============================")
-    print("IMPACT / SPREAD METRICS (BUCKETED)")
+    print(f"IMPACT / SPREAD METRICS (bucket={bucket_str})")
     print("==============================")
 
-    # Effective spread proxy (bucket VWAP vs bucket mid)
+    # Effective spread proxy (bucket VWAP vs bucket mid), only buckets with trades
     has_tr = (n_trades > 0) & np.isfinite(vwap) & np.isfinite(mid)
     eff = 2.0 * np.abs(vwap[has_tr] - mid[has_tr])
     if eff.size:
-        print(f"  Effective spread proxy (2*|VWAP-mid|) over trade buckets:")
+        print("  Effective spread proxy (2*|VWAP-mid|) over trade buckets:")
         print(f"    n={eff.size:,}  mean={eff.mean():.6g}  p50={np.quantile(eff,0.5):.6g}  p95={np.quantile(eff,0.95):.6g}")
     else:
         print("  Effective spread proxy: no trade buckets with finite VWAP/mid.")
 
-    # Impact/response at horizons
+    # Response / impact at horizons
     flow_sign = np.sign(flow).astype(np.float64, copy=False)
     flow_sign[~np.isfinite(flow_sign)] = 0.0
 
-    for h in HORIZONS:
+    horizons = HORIZONS_BY_BUCKET.get(bucket_str, [1, 2, 5, 10])
+    for h in horizons:
         if h <= 0 or h >= mid.size:
             continue
         mid0 = mid[:-h]
@@ -355,23 +365,38 @@ def main() -> None:
         print(f"    mean signed impact sign(flow)*Δmid = {imp.mean(): .6g}")
         print(f"    p05/p50/p95 signed impact = {np.quantile(imp,0.05):.6g} / {np.quantile(imp,0.5):.6g} / {np.quantile(imp,0.95):.6g}")
 
-    # =============================
-    # 8) Order-flow persistence proxy (bucket sign ACF)
-    # =============================
+
+def run_flow_persistence(df: pl.DataFrame, bucket_str: str) -> None:
+    flow = df["flow"].to_numpy().astype(np.float64)
+    flow_sign = np.sign(flow).astype(np.float64, copy=False)
+    flow_sign[~np.isfinite(flow_sign)] = 0.0
+
+    # Two views:
+    # (1) Clock-time with zeros (includes silence)
+    # (2) Event-time on non-zero buckets only (persistence conditional on trading)
     print("\n==============================")
-    print("ORDER-FLOW PERSISTENCE (BUCKET SIGN)")
+    print(f"ORDER-FLOW PERSISTENCE (bucket={bucket_str})")
     print("==============================")
+
     acf = autocorr(flow_sign, ACF_LAGS_FLOW_SIGN)
     for lag in [1, 2, 5, 10, 20, 50]:
         if lag <= ACF_LAGS_FLOW_SIGN:
-            print(f"  ACF(sign(flow))[{lag:2d}] = {acf[lag-1]: .6f}")
+            print(f"  ACF_clock(sign(flow))[{lag:2d}] = {acf[lag-1]: .6f}")
 
-    # =============================
-    # 9) Mid-price microstructure sanity (bucket returns)
-    # =============================
+    nz = flow_sign[flow_sign != 0.0]
+    acf_nz = autocorr(nz, min(ACF_LAGS_FLOW_SIGN, max(1, nz.size - 2))) if nz.size else np.full(ACF_LAGS_FLOW_SIGN, np.nan)
+    for lag in [1, 2, 5, 10, 20, 50]:
+        if lag <= (acf_nz.size if hasattr(acf_nz, "size") else 0):
+            print(f"  ACF_event(sign(flow)|flow!=0)[{lag:2d}] = {acf_nz[lag-1]: .6f}")
+
+
+def run_mid_dynamics(df: pl.DataFrame, bucket_str: str) -> None:
+    mid = df["mid"].to_numpy().astype(np.float64)
+
     print("\n==============================")
-    print("MID-PRICE DYNAMICS (BUCKET RETURNS)")
+    print(f"MID-PRICE DYNAMICS (bucket={bucket_str})")
     print("==============================")
+
     ok_mid = np.isfinite(mid)
     mid_v = mid[ok_mid]
     dmid = np.diff(mid_v)
@@ -380,12 +405,84 @@ def main() -> None:
         acf_r = autocorr(dmid, 10)
         for lag in [1, 2, 5, 10]:
             print(f"  ACF(Δmid)[{lag:2d}] = {acf_r[lag-1]: .6f}")
+    else:
+        print("  Δmid: insufficient finite mid samples.")
 
-    # =============================
-    # Optional plots
-    # =============================
-    # plot_counts(f"Spread histogram - ALL (bucket={BUCKET})", counts_all, over_all, MAX_SPREAD_TICKS, MAX_SHOW_TICKS)
-    # plt.show()
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    # Preprocess if needed
+    if not os.path.isdir(Path("out", "order_book_stats")):
+        print("PREPROCESSING STARTING")
+        subprocess.run([Path("build", "apps", "parser", "Parser.exe"), "logs", "out", str(500_000)])
+        print("PREPROCESSING DONE")
+
+    plu_glob = Path("out", "order_book_stats", "*.parquet")
+    trd_glob = Path("out", "trade", "*.parquet")
+
+    con = duckdb.connect(database=":memory:")
+    con.execute("SET temp_directory = 'duckdb_temp/'")
+    con.execute("SET max_memory = '4GB'")
+
+    print("\n==============================")
+    print("BOOK HEALTH (NO BUCKETING)")
+    print("==============================")
+
+    health = con.execute(f"""
+        SELECT
+            count(*) as n_quotes,
+            sum(CAST(book_valid AS INT)) as n_valid,
+            sum(CAST(is_crossed AS INT)) as n_crossed
+        FROM read_parquet('{plu_glob}')
+    """).fetchone()
+
+    n_trades_total = con.execute(f"""
+        SELECT count(*) as n_trades
+        FROM read_parquet('{trd_glob}')
+    """).fetchone()[0]
+
+    n_quotes, n_valid, n_cross = health
+    print(f"Quotes: {n_quotes:,}")
+    print(f"Trades: {n_trades_total:,}")
+    print(f"  book_valid=True: {n_valid:,} ({(n_valid / n_quotes) if n_quotes else 0.0:6.2%})")
+    print(f"  is_crossed=True: {n_cross:,} ({(n_cross / n_quotes) if n_quotes else 0.0:6.2%})")
+
+    # Build the union of bucket widths we will need across diagnostics
+    buckets_needed = sorted({b for bs in BUCKETS.values() for b in bs}, key=bucket_ns)
+
+    # Cache bucketed frames to avoid repeated heavy scans
+    cache: dict[str, pl.DataFrame] = {}
+
+    def get_df(bucket_str: str) -> pl.DataFrame:
+        if bucket_str not in cache:
+            print(f"\n[DuckDB] Aggregating bucket={bucket_str} ...")
+            cache[bucket_str] = bucketed_view(con, plu_glob, trd_glob, bucket_str)
+        return cache[bucket_str]
+
+    # 1) Spread distributions at book-state scales
+    for b in BUCKETS["spread_dist"]:
+        run_spread_distribution(get_df(b), b)
+
+    # 2) Activity vs vol at meso scales
+    for b in BUCKETS["activity_vs_vol"]:
+        run_activity_vs_vol(get_df(b), b)
+
+    # 3) Impact / effective spread at micro scales
+    for b in BUCKETS["impact"]:
+        run_impact_and_effective_spread(get_df(b), b)
+
+    # 4) Order-flow persistence at a couple of scales
+    for b in BUCKETS["flow_persistence"]:
+        run_flow_persistence(get_df(b), b)
+
+    # 5) Mid-price dynamics at micro + meso scales
+    for b in BUCKETS["mid_dynamics"]:
+        run_mid_dynamics(get_df(b), b)
+
+    # Optional: if you want to force materialization in a controlled order
+    _ = [get_df(b) for b in buckets_needed]
 
 
 if __name__ == "__main__":
