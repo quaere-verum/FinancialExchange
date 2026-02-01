@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "types.hpp"
 #include "rng.hpp"
@@ -105,17 +106,21 @@ public:
         s_.bias = std::clamp(s_.bias, -1.0, 1.0);
     }
 
-    InsertDecision decide_insert(const SimulationState<N>& state, double cumulative_hazard, RNG* rng) const {
+    inline void decide_insert(
+        const SimulationState<N>& state,
+        double cumulative_hazard,
+        RNG* rng,
+        std::vector<InsertDecision>& insert_decisions
+    ) const {
         const auto ps = state.price_state();
-        const auto vs = state.vol_state(); (void)vs;
-        const auto fs = state.flow_state(); (void)fs;
+        const auto ls = state.liq_state();
 
-        // If no BBO, fall back to “poke around last trade”
         if (!ps.best_bid || !ps.best_ask) {
             const Side side = (rng->standard_uniform() < 0.5) ? Side::BUY : Side::SELL;
             const Price_t ref = ps.last_trade_price;
             const Price_t px = (side == Side::BUY) ? (ref - 2) : (ref + 2);
-            return { side, px, (Volume_t)1, Lifespan::GOOD_FOR_DAY, p_.hazard_max + cumulative_hazard };
+            insert_decisions.push_back({ side, px, (Volume_t)1, Lifespan::GOOD_FOR_DAY, p_.hazard_max + cumulative_hazard });
+            return;
         }
 
         const Price_t bb = *ps.best_bid;
@@ -125,39 +130,10 @@ public:
         const double urgency = s_.urgency;
         const double bias = s_.bias;
 
-        // --- Side choice ---
-        const double p_buy = std::clamp(0.5 + 0.45 * bias, 0.02, 0.98);
+        // --- Side choice: bias dominates when urgent, noise dominates when not urgent ---
+        const double bias_weight = 0.35 + 0.65 * urgency;              // [0.35,1.0]
+        const double p_buy = std::clamp(0.5 + 0.45 * (bias_weight * bias), 0.05, 0.95);
         const Side side = (rng->standard_uniform() < p_buy) ? Side::BUY : Side::SELL;
-
-        // --- Aggressiveness: cross vs join best vs improve inside ---
-        // Cross more when urgency is high and spread is tight.
-        const double tight01 = std::clamp((2.0 - spread_ticks) / 2.0, 0.0, 1.0); // 1 when spread<=0..2 ticks
-        double p_cross = p_.p_cross_base + (p_.p_cross_max - p_.p_cross_base) * urgency * (0.35 + 0.65 * tight01);
-        p_cross = std::clamp(p_cross, 0.0, 0.95);
-
-        // Improve inside (one tick) when spread >=2 and urgency moderate (but not as much as cross)
-        double p_improve = 0.10 * urgency;
-        if (spread_ticks < 2.0) p_improve = 0.0;
-
-        // Ensure join-best has some probability
-        double p_join = std::max(p_.p_join_best_floor, 1.0 - p_cross - p_improve);
-        // Renormalize to sum to 1
-        const double Z = p_cross + p_improve + p_join;
-        p_cross /= Z; p_improve /= Z; p_join /= Z;
-
-        const double u = rng->standard_uniform();
-        Price_t px;
-        if (u < p_cross) {
-            // Cross: buy hits ask, sell hits bid
-            Price_t offset = sample_aggressive_offset_ticks(urgency, rng);
-            px = (side == Side::BUY) ? ba +  offset: bb - offset;
-        } else if (u < p_cross + p_improve) {
-            // Improve by 1 tick inside spread
-            px = (side == Side::BUY) ? (bb + 1) : (ba - 1);
-        } else {
-            // Join best
-            px = (side == Side::BUY) ? bb : ba;
-        }
 
         // --- Size ---
         const double z = rng->standard_normal();
@@ -166,12 +142,54 @@ public:
         q = std::clamp(q, (double)p_.min_qty, (double)p_.max_qty);
         const Volume_t qty = (Volume_t)std::llround(q);
 
-        double hazard = p_.hazard_max - (p_.hazard_max - p_.hazard_min) * urgency;
-        hazard = std::clamp(hazard, p_.hazard_min, p_.hazard_max);
-        Lifespan lifespan = Lifespan::GOOD_FOR_DAY;
+        // --- Thinness at touch (depth0) to condition aggressiveness ---
+        const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
+        // crude normalization; ideally reuse your global thin01
+        const double thin01 = std::clamp(1.0 - std::log1p(depth0) / 6.0, 0.0, 1.0);
 
-        return { side, px, qty, lifespan, hazard + cumulative_hazard };
+        // --- Aggressiveness probabilities ---
+        const double tight01 = std::clamp((2.0 - spread_ticks) / 2.0, 0.0, 1.0);
+
+        // Cross more when urgent AND either tight OR thin (thin -> grab before it vanishes)
+        double p_cross = p_.p_cross_base +
+            (p_.p_cross_max - p_.p_cross_base) * urgency * (0.45 + 0.35 * tight01 + 0.20 * thin01);
+        p_cross = std::clamp(p_cross, 0.0, 0.95);
+
+        double p_improve = 0.08 * urgency * (1.0 - 0.7 * thin01);
+        if (spread_ticks < 2.0) p_improve = 0.0;
+
+        double p_join = std::max(p_.p_join_best_floor, 1.0 - p_cross - p_improve);
+
+        const double Z = p_cross + p_improve + p_join;
+        p_cross /= Z; p_improve /= Z; p_join /= Z;
+
+        // --- Choose action and price ---
+        const double u = rng->standard_uniform();
+        Price_t px;
+
+        if (u < p_cross) {
+            // Depth-aware "sweep": choose how many levels to cross so expected fill >= qty
+            const size_t levels = choose_sweep_levels_(side, qty, ls, urgency, rng);
+
+            // Marketable limit price: last swept level (prevents absurd ba+10 jumps)
+            // Assumes tick size = 1 and contiguous levels. If your book is sparse, map levels to price ladder.
+            px = (side == Side::BUY) ? (Price_t)(ba + (Price_t)(levels ? (levels - 1) : 0))
+                                    : (Price_t)(bb - (Price_t)(levels ? (levels - 1) : 0));
+        } else if (u < p_cross + p_improve) {
+            px = (side == Side::BUY) ? (Price_t)(bb + 1) : (Price_t)(ba - 1);
+        } else {
+            px = (side == Side::BUY) ? bb : ba;
+        }
+
+        // --- Hazard mass ---
+        // Interpret taker as IOC-like when urgent: if not filled quickly, cancel quickly => small mass
+        // Non-urgent join/improve orders can rest longer => larger mass
+        double mass = p_.hazard_max - (p_.hazard_max - p_.hazard_min) * urgency; // urgent -> small
+        mass = std::clamp(mass, p_.hazard_min, p_.hazard_max);
+
+        insert_decisions.push_back({ side, px, qty, Lifespan::GOOD_FOR_DAY, cumulative_hazard + mass });
     }
+
 
 private:
     TakerParams p_;
@@ -185,4 +203,31 @@ private:
         while (k < 10 && rng->standard_uniform() > p) ++k; // geometric tail
         return k; // 0..10
     }
+
+    inline size_t choose_sweep_levels_(
+        Side side,
+        Volume_t qty,
+        const LiquidityState<N>& ls,
+        double urgency,
+        RNG* rng
+    ) const {
+        // Try to sweep enough levels so that cumulative displayed volume >= qty
+        // But allow randomness and urgency dependence (more urgent => more likely to sweep deeper).
+        Volume_t cum = 0;
+        size_t lvl = 0;
+
+        const size_t max_lvl = N; // cap sweeps
+        const double slack = 0.85 + 0.30 * urgency;             // urgent tolerates less shortfall
+
+        while (lvl < max_lvl && (double)cum < slack * (double)qty) {
+            const Volume_t v = (side == Side::BUY) ? ls.ask_volumes[lvl] : ls.bid_volumes[lvl];
+            cum += v;
+            ++lvl;
+            // Random early stop: sometimes they don't fully sweep displayed depth
+            if (lvl >= 2 && rng->standard_uniform() < (0.15 * (1.0 - urgency))) break;
+        }
+
+        return std::max<size_t>(1, lvl);
+    }
+
 };

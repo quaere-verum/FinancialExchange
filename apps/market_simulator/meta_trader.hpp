@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "types.hpp"
 #include "rng.hpp"
@@ -133,7 +134,12 @@ public:
     }
 
     // Generate a META insert. Call only when sampled as META.
-    InsertDecision decide_insert(const SimulationState<N>& state, double cumulative_hazard, RNG* rng) const {
+    inline void decide_insert(
+        const SimulationState<N>& state, 
+        double cumulative_hazard, 
+        RNG* rng,
+        std::vector<InsertDecision>& insert_decisions
+    ) const {
         const auto ps = state.price_state();
         const auto ls = state.liq_state();
         const auto vs = state.vol_state();
@@ -159,7 +165,8 @@ public:
             double q = base * std::exp(p_.qty_sigma * z);
             q = std::clamp(q, (double)p_.min_qty, (double)p_.max_qty);
 
-            return { side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p_.hazard_min + cumulative_hazard};
+            insert_decisions.push_back({ side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p_.hazard_min + cumulative_hazard});
+            return;
         }
 
         const Price_t bb = *ps.best_bid;
@@ -233,7 +240,8 @@ public:
 
         Lifespan lifespan = Lifespan::GOOD_FOR_DAY;
 
-        return { side, px, qty, lifespan, hazard + cumulative_hazard };
+        insert_decisions.push_back({ side, px, qty, lifespan, hazard + cumulative_hazard });
+        return;
     }
 
 private:

@@ -3,6 +3,7 @@
 #include "util.hpp"
 #include "rng.hpp"
 #include "state.hpp"
+#include <vector>
 
 
 struct NoiseParams {
@@ -29,11 +30,12 @@ struct NoiseParams {
 };
 
 template <size_t N>
-static inline InsertDecision decide_noise_insert(
+static inline void decide_noise_insert(
     const SimulationState<N>& state,
     double cumulative_hazard,
     RNG* rng,
-    const NoiseParams& p = {}
+    const NoiseParams& p,
+    std::vector<InsertDecision>& insert_decisions
 ) {
     const auto ps = state.price_state();
     const auto vs = state.vol_state();
@@ -50,7 +52,8 @@ static inline InsertDecision decide_noise_insert(
         const double base = std::max(1e-6, p.mean_qty);
         double q = base * std::exp(p.qty_sigma * z);
         q = std::clamp(q, (double)p.min_qty, (double)p.max_qty);
-        return { side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard };
+        insert_decisions.push_back({ side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard });
+        return;
     }
 
     const Price_t bb = *ps.best_bid;
@@ -84,5 +87,6 @@ static inline InsertDecision decide_noise_insert(
     double q = base * std::exp(p.qty_sigma * z);
     q = std::clamp(q, (double)p.min_qty, (double)p.max_qty);
 
-    return { side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard };
+    insert_decisions.push_back({ side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard });
+    return;
 }

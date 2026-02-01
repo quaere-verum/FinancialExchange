@@ -14,8 +14,8 @@
 #include <iostream>
 
 
-constexpr double LAMBDA_TOTAL = 20'000;
-constexpr double CANCEL_FRACTION = 0.85;
+constexpr double LAMBDA_TOTAL = 25'000;
+constexpr double CANCEL_FRACTION = 0.70;
 constexpr double LAMBDA_INSERT_BASE = LAMBDA_TOTAL * (1 - CANCEL_FRACTION);
 constexpr double LAMBDA_CANCEL_BASE = LAMBDA_TOTAL * CANCEL_FRACTION;
 
@@ -36,11 +36,33 @@ public:
     , deep_params_(std::move(deep_params))
     , noise_params_(std::move(noise_params)) {}
 
-    InsertDecision decide_insert(const SimulationState<N>& state, double cumulative_hazard, size_t batch_size, RNG* rng) {
+    void decide_insert(
+        const SimulationState<N>& state, 
+        double cumulative_hazard, 
+        size_t batch_size, 
+        RNG* rng,
+        std::vector<InsertDecision>& insert_decisions
+    ) {
         AgentType agent_type = sample_agent(rng);
 
-        constexpr double BUMP = 0.35;
-        const double bump = BUMP / static_cast<double>(std::max((size_t)1, batch_size));
+        constexpr double BUMP_BASE = 0.35;
+        const auto vs = state.vol_state();
+        const auto fs = state.flow_state();
+
+        const double absflow = std::abs(fs.flow_imbalance);
+
+        const double vol_s = vs.realised_vol_short;
+        const double vol_l = vs.realised_vol_long;
+        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
+        const double stress_p = std::max(0.0, stress);
+        const double tox = 
+            0.8 * stress_p +
+            0.8 * absflow +
+            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
+
+        // 0 below 0, 1 above 1
+        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
+        const double bump = (1.0 - gate) * BUMP_BASE / static_cast<double>(std::max((size_t)1, batch_size));
         switch (agent_type) {
             case AgentType::MAKER: agent_mix_state_.mm_boost    += bump; break;
             case AgentType::TAKER: agent_mix_state_.taker_boost += bump; break;
@@ -49,23 +71,22 @@ public:
             case AgentType::META:  break;
         }
 
-        agent_mix_state_.mm_boost    = std::clamp(agent_mix_state_.mm_boost,   -2.0, 2.0);
-        agent_mix_state_.taker_boost = std::clamp(agent_mix_state_.taker_boost,-2.0, 2.0);
-        agent_mix_state_.deep_boost  = std::clamp(agent_mix_state_.deep_boost, -2.0, 2.0);
-        agent_mix_state_.noise_boost = std::clamp(agent_mix_state_.noise_boost,-2.0, 2.0);
+        agent_mix_state_.mm_boost    = std::clamp(agent_mix_state_.mm_boost,    -0.5, 0.5);
+        agent_mix_state_.taker_boost = std::clamp(agent_mix_state_.taker_boost, -0.5, 0.5);
+        agent_mix_state_.deep_boost  = std::clamp(agent_mix_state_.deep_boost,  -0.5, 0.5);
+        agent_mix_state_.noise_boost = std::clamp(agent_mix_state_.noise_boost, -0.5, 0.5);
         if (agent_type != AgentType::META) agent_mix_state_.last = agent_type;
         
-        InsertDecision decision;
         switch (agent_type) {
-            case AgentType::MAKER: decision = mm_archetype_.decide_insert(state, cumulative_hazard, rng); break;
-            case AgentType::TAKER: decision = taker_archetype_.decide_insert(state, cumulative_hazard, rng); break;
-            case AgentType::DEEP: decision = decide_deep_insert(state, cumulative_hazard, rng, deep_params_); break;
-            case AgentType::NOISE: decision = decide_noise_insert(state, cumulative_hazard, rng, noise_params_); break;
-            case AgentType::META: decision = meta_archetype_.decide_insert(state, cumulative_hazard, rng); break;
+            case AgentType::MAKER: mm_archetype_.decide_insert(state, cumulative_hazard, rng, insert_decisions); break;
+            case AgentType::TAKER: taker_archetype_.decide_insert(state, cumulative_hazard, rng, insert_decisions); break;
+            case AgentType::DEEP: decide_deep_insert(state, cumulative_hazard, rng, deep_params_, insert_decisions); break;
+            case AgentType::NOISE: decide_noise_insert(state, cumulative_hazard, rng, noise_params_, insert_decisions); break;
+            case AgentType::META: meta_archetype_.decide_insert(state, cumulative_hazard, rng, insert_decisions); break;
             default: throw std::runtime_error("Unknown AgentType.");
         }
 
-        return decision;
+        return;
     }
 
     void update_intensity(
@@ -113,7 +134,7 @@ public:
         const double meta = std::clamp((double)meta_archetype_.activity(), 0.0, 1.0);
 
         // Open-order feedback control in log space (stable across magnitudes)
-        constexpr double OPEN_TARGET = 50'000.0;
+        constexpr double OPEN_TARGET = 1'000.0;
         const double open_log = std::log1p((double)open_order_count);
         const double open_target_log = std::log1p(OPEN_TARGET);
         const double open_err = open_log - open_target_log; // >0 means too many open orders
@@ -219,15 +240,21 @@ private:
         const double stress_p = std::max(0.0, stress);
 
         const double rate_n = std::clamp(fs.trade_rate_ewma_short / std::max(fs.trade_rate_ewma_long, 1e-6), 0.0, 3.0);
+        const double tox = 
+            0.8 * stress_p +
+            0.8 * absflow +
+            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
+
+        // 0 below 0, 1 above 1
+        const double mm_gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
 
         // Interpret: higher logit => more likely
         double l_mm =
             2.50
             - 0.6 * spread_n        // tight spread => MM more likely
-            - 0.5 * stress_p        // stress => makers pull back
             + 0.2 * rate_n
-            - 0.6 * absflow        // extreme flow => MM less dominant
-            + 0.10 * lambda_ratio;
+            - 3.0 * mm_gate
+            - 0.40 * std::max(0.0, lambda_ratio);
 
         double l_taker =
             -0.80
@@ -236,7 +263,7 @@ private:
             + 0.25 * stress_p 
             - 0.35 * spread_n
             + 0.24 * stress_p * spread_n // only in stressed markets does wide spread go with urgency
-            + 0.1 * lambda_ratio;
+            + 0.2 * std::max(0.0, lambda_ratio);
 
         double l_deep =
             -0.10
@@ -266,7 +293,7 @@ private:
         // Optional: thin top-of-book => encourage MM/DEEP
         // (Depth_n small means thin)
         const double thin = std::clamp(2.0 - depth_n, 0.0, 2.0);
-        l_mm   += 0.3 * thin;
+        l_mm   += 0.3 * thin * (1.0 - 1.5 * mm_gate);
         l_deep += 0.2 * thin;
 
         // Softmax sample
@@ -286,10 +313,29 @@ private:
     }
 
     void update_agent_mix(const SimulationState<N>& state, RNG* rng) {
-        constexpr double TAU_INERTIA = 0.1;
+        const auto fs = state.flow_state();
+        const auto vs = state.vol_state();
+        const double absflow = std::abs(fs.flow_imbalance);
+
+        const double vol_s = vs.realised_vol_short;
+        const double vol_l = vs.realised_vol_long;
+        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
+        const double stress_p = std::max(0.0, stress);
+        const double tox = 
+            0.8 * stress_p +
+            0.8 * absflow +
+            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
+        
+
+        // 0 below 0, 1 above 1
+        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
+        constexpr double TAU_INERTIA_CALM = 0.2;
+        constexpr double TAU_INERTIA_STRESS = 0.01;
+
+        const double tau_inertia = TAU_INERTIA_CALM * (1.0 - 0.8 * gate) + TAU_INERTIA_STRESS * gate;
 
         const double dt = state.time_state().time_since_previous_sync;
-        const double a = 1.0 - std::exp(-dt / TAU_INERTIA);
+        const double a = 1.0 - std::exp(-dt / tau_inertia);
 
         agent_mix_state_.mm_boost *= (1.0 - a);
         agent_mix_state_.taker_boost *= (1.0 - a);
@@ -299,11 +345,18 @@ private:
     }
 
     inline AgentType sample_agent(RNG* rng) {
-        double u = rng->standard_uniform();
-        for (size_t i = 0; i < agent_cdf_.size(); ++i) {
-            if (u <= agent_cdf_[i]) return static_cast<AgentType>(i);
+        // double u = rng->standard_uniform();
+        // for (size_t i = 0; i < agent_cdf_.size(); ++i) {
+        //     if (u <= agent_cdf_[i]) return static_cast<AgentType>(i);
+        // }
+        // return static_cast<AgentType>(agent_cdf_.size() - 1);
+        const double u = rng->standard_uniform();
+        const double p_maker = agent_cdf_[0] / (agent_cdf_[0] + agent_cdf_[1] + 1e-6);
+        if (u <= p_maker) {
+            return AgentType::MAKER;
+        } else {
+            return AgentType::TAKER;
         }
-        return static_cast<AgentType>(agent_cdf_.size() - 1);
     }
 
 

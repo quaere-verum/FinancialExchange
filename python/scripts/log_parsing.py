@@ -321,7 +321,13 @@ def run_activity_vs_vol(df: pl.DataFrame, bucket_str: str) -> None:
     print(f"  Corr(n_quote_events, ewma_variance) = {corr_pair(n_quotes_b, vol): .6f}")
 
 
-def run_impact_and_effective_spread(df: pl.DataFrame, bucket_str: str) -> None:
+def run_impact_and_effective_spread(
+    df: pl.DataFrame,
+    bucket_str: str,
+    con: duckdb.DuckDBPyConnection,
+    plu_glob: Path,
+    trd_glob: Path,
+) -> None:
     mid = df["mid"].to_numpy().astype(np.float64)
     flow = df["flow"].to_numpy().astype(np.float64)
     n_trades = df["n_trades"].to_numpy().astype(np.float64)
@@ -331,16 +337,16 @@ def run_impact_and_effective_spread(df: pl.DataFrame, bucket_str: str) -> None:
     print(f"IMPACT / SPREAD METRICS (bucket={bucket_str})")
     print("==============================")
 
-    # Effective spread proxy (bucket VWAP vs bucket mid), only buckets with trades
+    # --- (A) Bucket-time effective spread proxy (your existing one) ---
     has_tr = (n_trades > 0) & np.isfinite(vwap) & np.isfinite(mid)
     eff = 2.0 * np.abs(vwap[has_tr] - mid[has_tr])
     if eff.size:
-        print("  Effective spread proxy (2*|VWAP-mid|) over trade buckets:")
+        print("  Bucket effective spread proxy (2*|VWAP-mid|) over trade buckets:")
         print(f"    n={eff.size:,}  mean={eff.mean():.6g}  p50={np.quantile(eff,0.5):.6g}  p95={np.quantile(eff,0.95):.6g}")
     else:
-        print("  Effective spread proxy: no trade buckets with finite VWAP/mid.")
+        print("  Bucket effective spread proxy: no trade buckets with finite VWAP/mid.")
 
-    # Response / impact at horizons
+    # --- (B) Bucket-time signed impact (your existing one) ---
     flow_sign = np.sign(flow).astype(np.float64, copy=False)
     flow_sign[~np.isfinite(flow_sign)] = 0.0
 
@@ -353,17 +359,64 @@ def run_impact_and_effective_spread(df: pl.DataFrame, bucket_str: str) -> None:
         fs = flow_sign[:-h]
 
         ok = np.isfinite(mid0) & np.isfinite(midf) & (fs != 0.0)
-        if ok.sum() < 100:
-            print(f"\n  Horizon {h} buckets: insufficient samples ({int(ok.sum()):,}).")
+        if ok.sum() < 200:
+            print(f"\n  Bucket horizon {h}: insufficient samples ({int(ok.sum()):,}).")
             continue
 
         resp = (midf[ok] - mid0[ok])
         imp = fs[ok] * resp
 
-        print(f"\n  Horizon {h} buckets:")
+        print(f"\n  Bucket horizon {h} buckets:")
         print(f"    mean response (midf-mid0) = {resp.mean(): .6g}")
         print(f"    mean signed impact sign(flow)*Δmid = {imp.mean(): .6g}")
         print(f"    p05/p50/p95 signed impact = {np.quantile(imp,0.05):.6g} / {np.quantile(imp,0.5):.6g} / {np.quantile(imp,0.95):.6g}")
+
+    
+    print("\n  -- Trade-time impact using mid_pre/mid_post via ASOF JOIN --")
+    impact_tbl = trade_time_impact_stats(
+        con,
+        plu_glob,
+        trd_glob,
+        bucket_str,
+        horizons,
+        abs_sv_quantiles=(0.0, 0.5, 0.9),  # all, top50%, top10% by |signed_volume|
+    )
+
+    if impact_tbl.is_empty():
+        print("    (no trade-time impact samples)")
+        return
+
+    # Print grouped by horizon then sample
+    # (Small table; plain printing is fine.)
+    for h in horizons:
+        sub_h = impact_tbl.filter(pl.col("horizon_buckets") == h)
+        if sub_h.is_empty():
+            continue
+
+        print(f"\n  Trade horizon {h} * {bucket_str}:")
+
+        # Keep print order stable: all, top50, top90
+        for sample in ["all", "top50", "top90"]:
+            sub = sub_h.filter(pl.col("sample") == sample)
+            if sub.is_empty():
+                continue
+
+            r = sub.row(0, named=True)
+            n = int(r["n"])
+            print(f"    Sample={sample:>5s}  n={n:,}  (|sv| >= {r['abs_sv_threshold']:.6g})")
+            print(f"      mean response (mid_post-mid_pre) = {r['mean_resp']:.6g}")
+            print(f"      mean signed impact  E[s*Δmid]    = {r['mean_signed_impact']:.6g}")
+            print(f"      drift-adj impact    E[s*(Δmid-EΔ)] = {r['mean_signed_impact_drift_adj']:.6g}")
+            print(f"      mean_sign E[s]      = {r['mean_sign']:.6g}")
+
+            print(f"      signed impact p05/p50/p95 = {r['p05_signed_impact']:.6g} / {r['p50_signed_impact']:.6g} / {r['p95_signed_impact']:.6g}")
+
+            print("      trade-time effective spread 2*|px-mid_pre|:")
+            print(f"        mean={r['mean_eff_spread_trade']:.6g}  p50={r['p50_eff_spread_trade']:.6g}  p95={r['p95_eff_spread_trade']:.6g}")
+
+            print("      realized spread 2*s*(px-mid_post):")
+            print(f"        mean={r['mean_realized_spread']:.6g}  p05/p50/p95={r['p05_realized_spread']:.6g} / {r['p50_realized_spread']:.6g} / {r['p95_realized_spread']:.6g}")
+
 
 
 def run_flow_persistence(df: pl.DataFrame, bucket_str: str) -> None:
@@ -408,6 +461,170 @@ def run_mid_dynamics(df: pl.DataFrame, bucket_str: str) -> None:
     else:
         print("  Δmid: insufficient finite mid samples.")
 
+def trade_time_impact_stats(
+    con: duckdb.DuckDBPyConnection,
+    plu_glob: Path,
+    trd_glob: Path,
+    bucket_str: str,
+    horizons: list[int],
+    *,
+    abs_sv_quantiles: tuple[float, ...] = (0.0, 0.5, 0.9),  # 0.0 => all trades; then median+ and top decile+
+) -> pl.DataFrame:
+    """
+    Trade-time mid_pre and mid_post diagnostics using ASOF JOIN.
+
+    Adds:
+      - trade-time effective spread: 2*|px - mid_pre|
+      - response: mid_post - mid_pre
+      - signed impact: sign(sv) * (mid_post - mid_pre)
+      - drift-corrected signed impact: E[ s*(dmid - E[dmid]) ]
+      - realized spread at horizon H: 2*s*(px - mid_post)
+
+    Also computes stats for thresholds on |sv| (signed_volume magnitude),
+    e.g. all trades (q=0.0), top 50% (q=0.5), top 10% (q=0.9).
+    """
+    bns = bucket_ns(bucket_str)
+
+    # Precompute |sv| thresholds once (DuckDB) so each horizon reuses them
+    # Note: if abs_sv_quantiles includes 0.0, threshold will be 0.
+    qs = [q for q in abs_sv_quantiles if q > 0.0]
+    if qs:
+        q_list = ", ".join([str(q) for q in qs])
+        thr_query = f"""
+        WITH trades AS (
+            SELECT CAST(ABS(signed_volume) AS DOUBLE) AS abssv
+            FROM read_parquet('{trd_glob}')
+            WHERE signed_volume IS NOT NULL
+        )
+        SELECT
+            {", ".join([f"QUANTILE_CONT(abssv, {q}) AS q{int(q*100)}" for q in qs])}
+        FROM trades
+        """
+        thr_row = con.execute(thr_query).fetchone()
+        thr_map = {q: float(thr_row[i]) for i, q in enumerate(qs)}
+    else:
+        thr_map = {}
+
+    # Always include "all trades" threshold 0.0
+    thresholds = []
+    for q in abs_sv_quantiles:
+        if q <= 0.0:
+            thresholds.append(("all", 0.0))
+        else:
+            thresholds.append((f"top{int(q*100)}", thr_map.get(q, 0.0)))
+
+    out_rows: list[pl.DataFrame] = []
+
+    for h in horizons:
+        dt = int(h * bns)
+
+        for label, thr in thresholds:
+            # For drift-corrected signed impact we need:
+            # impact* = E[s*(dmid - mean(dmid))] = E[s*dmid] - E[s]*E[dmid]
+            # We'll compute:
+            #   mean_dmid, mean_s, mean_s_dmid
+            # and derive impact_star = mean_s_dmid - mean_s*mean_dmid
+            query = f"""
+            WITH
+            quotes AS (
+                SELECT
+                    CAST(timestamp AS UBIGINT) AS qts,
+                    (CAST(mid_px2_ticks AS DOUBLE) / 2.0) AS mid
+                FROM read_parquet('{plu_glob}')
+                WHERE mid_px2_ticks IS NOT NULL
+            ),
+            trades AS (
+                SELECT
+                    CAST(timestamp AS UBIGINT) AS ts,
+                    CAST(price AS DOUBLE) AS px,
+                    CAST(quantity AS DOUBLE) AS qty,
+                    CAST(signed_volume AS DOUBLE) AS sv,
+                    CAST(ABS(signed_volume) AS DOUBLE) AS abssv
+                FROM read_parquet('{trd_glob}')
+                WHERE signed_volume IS NOT NULL
+                  AND price IS NOT NULL
+                  AND quantity IS NOT NULL
+            ),
+            t_filt AS (
+                SELECT * FROM trades
+                WHERE abssv >= {thr}
+                  AND sv != 0
+            ),
+            t_pre AS (
+                SELECT
+                    t.ts, t.px, t.qty, t.sv,
+                    SIGN(t.sv) AS s,
+                    q.mid AS mid_pre
+                FROM t_filt t
+                ASOF JOIN quotes q
+                ON q.qts <= t.ts
+                WHERE q.mid IS NOT NULL
+            ),
+            t_post AS (
+                SELECT
+                    t_pre.*,
+                    q2.mid AS mid_post
+                FROM t_pre
+                ASOF JOIN quotes q2
+                ON q2.qts <= (t_pre.ts + CAST({dt} AS UBIGINT))
+                WHERE q2.mid IS NOT NULL
+            ),
+            feats AS (
+                SELECT
+                    s,
+                    (mid_post - mid_pre) AS dmid,
+                    (2.0 * ABS(px - mid_pre)) AS eff_spread_trade,
+                    (2.0 * s * (px - mid_post)) AS realized_spread
+                FROM t_post
+            )
+            SELECT
+                '{bucket_str}'::VARCHAR AS bucket,
+                {h}::INTEGER AS horizon_buckets,
+                {dt}::BIGINT AS horizon_ns,
+                '{label}'::VARCHAR AS sample,
+                {thr}::DOUBLE AS abs_sv_threshold,
+
+                COUNT(*)::BIGINT AS n,
+
+                -- response
+                AVG(dmid) AS mean_resp,
+                STDDEV_POP(dmid) AS std_resp,
+                QUANTILE_CONT(dmid, 0.05) AS p05_resp,
+                QUANTILE_CONT(dmid, 0.50) AS p50_resp,
+                QUANTILE_CONT(dmid, 0.95) AS p95_resp,
+
+                -- signed impact
+                AVG(s * dmid) AS mean_signed_impact,
+                QUANTILE_CONT(s * dmid, 0.05) AS p05_signed_impact,
+                QUANTILE_CONT(s * dmid, 0.50) AS p50_signed_impact,
+                QUANTILE_CONT(s * dmid, 0.95) AS p95_signed_impact,
+
+                -- drift-corrected signed impact: E[s*dmid] - E[s]*E[dmid]
+                (AVG(s * dmid) - AVG(s) * AVG(dmid)) AS mean_signed_impact_drift_adj,
+                AVG(s) AS mean_sign,
+
+                -- effective spread at trade time
+                AVG(eff_spread_trade) AS mean_eff_spread_trade,
+                QUANTILE_CONT(eff_spread_trade, 0.50) AS p50_eff_spread_trade,
+                QUANTILE_CONT(eff_spread_trade, 0.95) AS p95_eff_spread_trade,
+
+                -- realized spread at horizon
+                AVG(realized_spread) AS mean_realized_spread,
+                QUANTILE_CONT(realized_spread, 0.05) AS p05_realized_spread,
+                QUANTILE_CONT(realized_spread, 0.50) AS p50_realized_spread,
+                QUANTILE_CONT(realized_spread, 0.95) AS p95_realized_spread
+            FROM feats
+            """
+
+            out_rows.append(con.execute(query).pl())
+
+    if not out_rows:
+        return pl.DataFrame()
+
+    return pl.concat(out_rows, how="vertical")
+
+
+
 
 # -----------------------------
 # Main
@@ -422,9 +639,10 @@ def main() -> None:
     plu_glob = Path("out", "order_book_stats", "*.parquet")
     trd_glob = Path("out", "trade", "*.parquet")
 
-    con = duckdb.connect(database=":memory:")
+    con = duckdb.connect(database="temp_processing.db")
     con.execute("SET temp_directory = 'duckdb_temp/'")
-    con.execute("SET max_memory = '4GB'")
+    con.execute("SET max_memory = '6GB'")
+    con.execute("SET preserve_insertion_order = false")
 
     print("\n==============================")
     print("BOOK HEALTH (NO BUCKETING)")
@@ -461,6 +679,8 @@ def main() -> None:
             cache[bucket_str] = bucketed_view(con, plu_glob, trd_glob, bucket_str)
         return cache[bucket_str]
 
+    
+
     # 1) Spread distributions at book-state scales
     for b in BUCKETS["spread_dist"]:
         run_spread_distribution(get_df(b), b)
@@ -471,7 +691,9 @@ def main() -> None:
 
     # 3) Impact / effective spread at micro scales
     for b in BUCKETS["impact"]:
-        run_impact_and_effective_spread(get_df(b), b)
+        run_impact_and_effective_spread(get_df(b), b, con, plu_glob, trd_glob)
+
+
 
     # 4) Order-flow persistence at a couple of scales
     for b in BUCKETS["flow_persistence"]:

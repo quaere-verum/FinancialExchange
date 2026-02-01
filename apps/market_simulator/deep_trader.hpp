@@ -4,6 +4,8 @@
 #include "state.hpp"
 #include "rng.hpp"
 
+#include <vector>
+
 struct DeepParams {
     // Deep placement region (ticks from best)
     int min_offset_ticks = 5;    // do not clutter near-touch
@@ -27,11 +29,12 @@ struct DeepParams {
 };
 
 template <size_t N>
-static inline InsertDecision decide_deep_insert(
+static inline void decide_deep_insert(
     const SimulationState<N>& state,
     double cumulative_hazard,
     RNG* rng,
-    const DeepParams& p = {}
+    const DeepParams& p,
+    std::vector<InsertDecision>& insert_decisions
 ) {
     const auto ps = state.price_state();
     const auto ls = state.liq_state();
@@ -50,7 +53,8 @@ static inline InsertDecision decide_deep_insert(
         const double base = std::max(1e-6, p.mean_qty);
         double q = base * std::exp(p.qty_sigma * z);
         q = std::clamp(q, (double)p.min_qty, (double)p.max_qty);
-        return { side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass };
+        insert_decisions.push_back({ side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass });
+        return;
     }
 
     const Price_t bb = *ps.best_bid;
@@ -92,5 +96,5 @@ static inline InsertDecision decide_deep_insert(
     double q = base * std::exp(p.qty_sigma * z);
     q = std::clamp(q, (double)p.min_qty, (double)p.max_qty);
 
-    return { side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard};
+    return insert_decisions.push_back({ side, px, (Volume_t)std::llround(q), Lifespan::GOOD_FOR_DAY, p.hazard_mass + cumulative_hazard});
 }
