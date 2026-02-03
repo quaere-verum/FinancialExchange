@@ -10,49 +10,7 @@
 #include "util.hpp"
 #include "rng.hpp"
 #include "state.hpp"
-
-static constexpr size_t MM_LADDER_SIZE = 6;
-
-struct MarketMakerParams {
-    // --- Quoting style ---
-    double p_improve_when_wide = 0.65;
-    double p_one_sided_when_stressed = 0.15;
-
-    // NEW: touch participation (join/backoff)
-    double p_join_touch_base = 0.92;        // calm: usually join touch
-    double join_risk_slope   = 0.75;        // risk reduces join prob
-    double improve_risk_slope = 0.70;       // risk reduces improve prob
-    Price_t backoff_ticks_max = 4;          // in stress, quote up to this far away (at lvl0)
-
-    // NEW: stochastic ladder depth
-    size_t ladder_levels_min = 1;           // per side (when quoting that side)
-    size_t ladder_levels_max = MM_LADDER_SIZE / 2; // per side
-    double ladder_level_mean_calm = 2.5;    // expected levels per side when risk~0
-    double ladder_level_mean_stress = 1.2;  // expected levels per side when risk~1
-
-    // --- Size model ---
-    Volume_t min_qty = 1;
-    Volume_t max_qty = 50;
-    double mean_qty = 5.0;
-    double qty_logn_sigma = 0.6;
-
-    // --- Stress response ---
-    double stress_spread_strength = 0.7;
-    double stress_vol_strength = 0.9;
-    double stress_flow_strength = 0.6;
-
-    // --- Cancellation / hazard (NOTE: lower mass => faster cancel in your model) ---
-    double base_hazard_mass = 1.0;
-    double hazard_mass_min = 0.15;
-    double hazard_mass_max = 4.0;
-
-    // NEW: stress should DECREASE hazard mass (faster cancels)
-    double hazard_stress_strength = 1.0;    // risk reduces mass by up to this fraction
-    double hazard_thin_strength   = 0.5;    // thin reduces mass further
-
-    // NEW: level shaping (touch smaller mass than deep)
-    double hazard_level_slope = 0.25;       // each deeper level increases mass
-};
+#include "parameters.hpp"
 
 
 struct MarketMakerLatentState {
@@ -62,7 +20,6 @@ struct MarketMakerLatentState {
     bool depth_ref_init = false;
 };
 
-template <size_t N>
 class MarketMakerAgent {
     public:
         explicit MarketMakerAgent(MarketMakerParams p = {}) : p_(p) {}
@@ -70,38 +27,13 @@ class MarketMakerAgent {
         MarketMakerLatentState& state() { return s_; }
         const MarketMakerLatentState& state() const { return s_; }
 
-        template<size_t N>
         void update(
-            const SimulationState<N>& state
+            const FeatureVector& state
         ) {
-            const auto ts = state.time_state();
-            const auto ps = state.price_state();
-            const auto ls = state.liq_state();
-            const auto vs = state.vol_state();
-            const auto fs = state.flow_state();
-            const auto lat = state.latent_state();
-
-            const double dt = std::max(0.0, ts.time_since_previous_sync);
+            const double dt = std::max(0.0, state.time_since_previous_sync);
             if (dt <= 0.0) return;
 
-            const double spread = ps.spread ? (double)(*ps.spread) : 0.0;
-            constexpr double SPREAD_CLIP = 10.0;
-            const double spread01 = std::clamp(spread, 0.0, SPREAD_CLIP) / SPREAD_CLIP; // 0..1 when spread<=SPREAD_CLIP ticks
-
-            const double vol_s = vs.realised_vol_short;
-            const double vol_l = vs.realised_vol_long;
-            const double vol_stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-            const double vol01 = std::clamp(std::max(0.0, vol_stress) / 1.5, 0.0, 1.0);
-
-            const double flow = fs.flow_imbalance;
-            const double absflow = std::abs(flow);
-
-            const double surp01 = std::clamp(fs.volume_surprise, 0.0, 2.0) / 2.0;
-
-            const double imb0 = std::clamp(ls.imbalances[0], -1.0, 1.0);
-
-            const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
-            const double logd0 = std::log(depth0 + 1.0);
+            const double logd0 = std::log(state.depth_at_touch + 1.0);
             if (!s_.depth_ref_init) {
                 s_.log_depth0_ref = logd0;
                 s_.depth_ref_init = true;
@@ -112,20 +44,28 @@ class MarketMakerAgent {
                 const double a = 1.0 - std::exp(-dt / TAU_DEPTH_REF);
                 s_.log_depth0_ref = (1.0 - a) * s_.log_depth0_ref + a * logd0;
             }
-            const double thin01 = std::clamp(s_.log_depth0_ref - logd0, 0.0, 2.0) / 2.0;
 
             // --- RISK update (EWMA to target) ---
             constexpr double TAU_RISK = 0.5; // seconds (fast-ish)
             const double a_r = 1.0 - std::exp(-dt / TAU_RISK);
 
-            const double r_target = std::clamp(
-                0.10 * spread01 +
-                0.40 * vol01 +
-                0.35 * absflow +
-                0.20 * surp01 +
-                0.30 * thin01,
-                0.0, 1.0
-            );
+            // const double r_target = std::clamp(
+            //     0.10 * state.spread01 +
+            //     0.40 * 0.5 * std::tanh(std::log(std::max(state.vol_ratio, EPS)) + 1.0) +
+            //     0.35 * std::fabs(state.flow_imbalance) +
+            //     0.20 * std::max(state.surprise_signx01, 0.0) +
+            //     0.30 * state.thin01,
+            //     0.0, 1.0
+            // );
+            // std::cout 
+            //     << "spread01=" << state.spread01
+            //     << ", vol_ratio=" << 0.5 * std::tanh(std::log(std::max(state.vol_ratio, EPS)) + 1.0)
+            //     << ", abs_flow_imb=" << std::fabs(state.flow_imbalance)
+            //     << ", surprise=" << std::max(state.surprise_signx01, 0.0)
+            //     << ", thin01=" << state.thin01
+            //     << ", r_target=" << r_target
+            //     << "\n";
+            const double r_target = state.stress_micro01;
 
             s_.risk = (1.0 - a_r) * s_.risk + a_r * r_target;
             s_.risk = std::clamp(s_.risk, 0.0, 1.0);
@@ -133,17 +73,11 @@ class MarketMakerAgent {
             // --- BIAS update (OU to target) ---
             constexpr double TAU_BIAS = 1.2; // seconds (slower)
             const double a_b = 1.0 - std::exp(-dt / TAU_BIAS);
-
-            // fair gap (weak)
-            const double mid = (ps.best_bid && ps.best_ask) ? 0.5 * ((double)*ps.best_bid + (double)*ps.best_ask)
-                                                            : (double)ps.last_trade_price;
-            const double fair_gap = std::clamp((lat.fair_value - mid) / std::max(1.0, mid), -0.02, 0.02) / 0.02; // now in [-1,1]
-            const double b_flow = 0.20 * (-flow) * (1.0 - 0.5 * s_.risk);
-
+            const double b_flow = 0.20 * (-state.flow_imbalance) * (1.0 - 0.5 * s_.risk);
             const double b_target = std::clamp(
                 b_flow +              // contrarian to taker pressure
-                0.25 * (-imb0) +      // lean against local book imbalance
-                0.15 * (fair_gap),    // weak anchor
+                0.25 * (-state.flow_imbalance) +      // lean against local book imbalance
+                0.15 * (state.mid_fair_gap),    // weak anchor
                 -1.0, 1.0
             );
 
@@ -155,26 +89,17 @@ class MarketMakerAgent {
         }
 
         inline void decide_insert(
-            const SimulationState<N>& state,
+            const FeatureVector& state,
             double cumulative_hazard,
             RNG* rng,
             std::vector<InsertDecision>& insert_decisions
         ) {
-            const auto ps  = state.price_state();
-            const auto ls  = state.liq_state();
-            const auto vs  = state.vol_state();
-            const auto fs  = state.flow_state();
-            const auto lat = state.latent_state();
-
             constexpr size_t half = MM_LADDER_SIZE / 2;
             const Lifespan lifespan = Lifespan::GOOD_FOR_DAY;
 
-            const bool has_bbo = ps.best_bid.has_value() && ps.best_ask.has_value();
-            if (!has_bbo) {
+            if (!state.has_ask_side || !state.has_bid_side) {
                 // fallback: still stochastic levels, and hazard decreases with risk (faster cancels)
-                const Price_t ref = ps.last_trade_price;
-
-                const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
+                const Price_t ref = state.last_trade_price;
 
                 // choose how many levels per side
                 const size_t levels = std::min(half, sample_levels_(rng));
@@ -196,7 +121,7 @@ class MarketMakerAgent {
                         (int)p_.min_qty, (int)p_.max_qty
                     );
 
-                    const double mass = choose_hazard_mass_(depth0, lvl);
+                    const double mass = choose_hazard_mass_(state.depth_at_touch, lvl);
                     const double hazard_threshold = cumulative_hazard + mass;
 
                     if (qty_bid > 0) insert_decisions.push_back({ Side::BUY,  (Price_t)(ref - d), qty_bid, lifespan, hazard_threshold });
@@ -204,84 +129,58 @@ class MarketMakerAgent {
                 }
                 return;
             }
-
-            // ---- Normal case ----
-            const Price_t bb = *ps.best_bid;
-            const Price_t ba = *ps.best_ask;
-            const double spread = (double)(ba - bb);
-
-            const double vb0 = (double)ls.bid_volumes[0];
-            const double va0 = (double)ls.ask_volumes[0];
-            const double depth0 = vb0 + va0;
-            const double imb0 = ls.imbalances[0];
-
-            const double flow = fs.flow_imbalance;
-            const double absflow = std::abs(flow);
-
-            // stress scalar (as before)
-            const double vol_s = vs.realised_vol_short;
-            const double vol_l = vs.realised_vol_long;
-            const double vol_stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-            const double vol_stress_p = std::max(0.0, vol_stress);
-
-            const double stress =
-                p_.stress_spread_strength * std::clamp(spread / 2.0, 0.0, 4.0) +
-                p_.stress_vol_strength    * vol_stress_p +
-                p_.stress_flow_strength   * absflow;
-
-            // one-sided flag (keep, but we’ll implement by skipping the inactive side)
             const bool one_sided = rng->standard_uniform() <
-                (p_.p_one_sided_when_stressed * std::clamp(stress / 2.0, 0.0, 1.0));
+                (p_.p_one_sided_when_stressed * state.stress01);
 
-            const Side preferred = choose_side_(imb0, flow, /*fair_gap*/0.0, rng);
+            const Side preferred = choose_side_(state.imbalance_at_touch, state.flow_imbalance, state.mid_fair_gap, rng);
 
             // --- decide join vs backoff at touch ---
             double p_join = p_.p_join_touch_base * (1.0 - p_.join_risk_slope * s_.risk);
-            p_join = std::clamp(p_join, 0.05, 0.98);
+            p_join = std::clamp(p_join, 0.0, 1.0);
 
             const bool join_touch = (rng->standard_uniform() < p_join);
             const Price_t backoff = join_touch ? (Price_t)0 : sample_backoff_(rng);
 
             // --- compute top-of-book prices using improve/join/backoff ---
             // reference mid (you can later blend in fair_value when risk low)
-            const Price_t ref_mid = clamp_mid_(bb, ba, lat.fair_value);
+            const Price_t ref_mid = clamp_mid_(*state.best_bid, *state.best_ask, state.fair_value);
 
             // discrete-but-not-quantized skew
             const Price_t skew = sample_tick_skew_(rng);
 
             // base half-spread target (still OK)
-            const Price_t half_sp = target_half_spread_ticks_(spread, depth0);
+            const Price_t half_sp = target_half_spread_ticks_(state, rng);
 
             Price_t bid0 = (Price_t)(ref_mid - half_sp + skew);
             Price_t ask0 = (Price_t)(ref_mid + half_sp + skew);
 
             // Do not cross
-            bid0 = std::min<Price_t>(bid0, (Price_t)(ba - 1));
-            ask0 = std::max<Price_t>(ask0, (Price_t)(bb + 1));
+            bid0 = std::min<Price_t>(bid0, (Price_t)(*state.best_ask - 1));
+            ask0 = std::max<Price_t>(ask0, (Price_t)(*state.best_bid + 1));
 
             // Decide improve vs join when wide
             // Improve only if spread>=2 and risk low-ish
-            const bool can_improve = (spread >= 2.0);
+            const bool can_improve = (state.spread >= 2.0);
             double p_improve = p_.p_improve_when_wide;
             p_improve *= (1.0 - p_.improve_risk_slope * s_.risk);
-            p_improve = std::clamp(p_improve, 0.01, 0.90);
+            p_improve = std::clamp(p_improve, 0.0, 1.0);
 
             const bool improve = can_improve && join_touch && (rng->standard_uniform() < p_improve);
 
             if (improve) {
                 // step inside
-                bid0 = (Price_t)std::min<Price_t>((Price_t)(bb + 1), (Price_t)(ba - 1));
-                ask0 = (Price_t)std::max<Price_t>((Price_t)(ba - 1), (Price_t)(bb + 1));
+                bid0 = (Price_t)std::min<Price_t>((Price_t)(*state.best_bid + 1), (Price_t)(*state.best_ask - 1));
+                ask0 = (Price_t)std::max<Price_t>((Price_t)(*state.best_ask - 1), (Price_t)(*state.best_bid + 1));
                 // note: above two lines keep you inside without crossing even if spread==2
                 // if spread==2, bb+1 == ba-1, that’s the only inside tick
             } else if (join_touch) {
                 // join touch, but don’t worsen
-                bid0 = std::max<Price_t>(bid0, bb);
-                ask0 = std::min<Price_t>(ask0, ba);
+                bid0 = std::max<Price_t>(bid0, *state.best_bid);
+                ask0 = std::min<Price_t>(ask0, *state.best_ask);
             } else {
                 // back off from touch
-                bid0 = (Price_t)std::min<Price_t>(bid0, (Price_t)(bb - backoff));
-                ask0 = (Price_t)std::max<Price_t>(ask0, (Price_t)(ba + backoff));
+                bid0 = (Price_t)std::min<Price_t>(bid0, (Price_t)(*state.best_bid - backoff));
+                ask0 = (Price_t)std::max<Price_t>(ask0, (Price_t)(*state.best_ask + backoff));
             }
 
             // Ladder step: larger in stress/risk
@@ -317,7 +216,7 @@ class MarketMakerAgent {
                 }
 
                 // Level-specific hazard thresholds (touch cancels faster; deep cancels slower)
-                const double mass = choose_hazard_mass_(depth0, lvl);
+                const double mass = choose_hazard_mass_(state.depth_at_touch, lvl);
                 const double hazard_threshold = cumulative_hazard + mass;
 
                 if (qty_bid > 0) insert_decisions.push_back({ Side::BUY,  px_bid, qty_bid, lifespan, hazard_threshold });
@@ -406,20 +305,17 @@ class MarketMakerAgent {
             return std::llround(ref);
         }
 
-        inline Price_t target_half_spread_ticks_(double spread_ticks, double depth0) const {
-            // Thinness proxy already in state, reuse it
-            const double logd0 = std::log1p(depth0);
-            const double thin_raw = std::clamp(s_.log_depth0_ref - logd0, 0.0, 2.0);
-            const double thin01 = thin_raw / 2.0;
-
+        inline Price_t target_half_spread_ticks_(const FeatureVector& state, RNG* rng) const {
             // Baseline: 1 tick, widen smoothly with risk & thinness
-            const double hs =
-                1.0
-                + 1.5 * s_.risk
-                + 1.0 * thin01;
+            double z = std::clamp(0.7 * state.stress_micro01 + 0.3 * state.thin01, 0.0, 1.0);
+            z = std::pow(z, MICRO_GAMMA);
 
-            // Cap half-spread so you don't explode spreads mechanically
-            return std::clamp((int)std::llround(hs), 1, 8);
+            double p_calm = 0.90;
+            double p_stress = 0.25;
+
+            double p = p_calm - (p_calm - p_stress) * z;   // decreases with stress
+            Price_t half_spread = 1 + sample_geometric_offset(rng, p, 10);
+            return half_spread;
         }
 
         inline Price_t sample_tick_skew_(RNG* rng) const {

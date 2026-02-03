@@ -6,6 +6,7 @@
 #include "deep_trader.hpp"
 #include "noise_trader.hpp"
 #include "meta_trader.hpp"
+#include "parameters.hpp"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -14,13 +15,7 @@
 #include <iostream>
 
 
-constexpr double LAMBDA_TOTAL = 25'000;
-constexpr double CANCEL_FRACTION = 0.70;
-constexpr double LAMBDA_INSERT_BASE = LAMBDA_TOTAL * (1 - CANCEL_FRACTION);
-constexpr double LAMBDA_CANCEL_BASE = LAMBDA_TOTAL * CANCEL_FRACTION;
 
-
-template<size_t N>
 class MarketDynamics {
 public:
     MarketDynamics(
@@ -37,7 +32,7 @@ public:
     , noise_params_(std::move(noise_params)) {}
 
     void decide_insert(
-        const SimulationState<N>& state, 
+        const FeatureVector& state, 
         double cumulative_hazard, 
         size_t batch_size, 
         RNG* rng,
@@ -46,22 +41,8 @@ public:
         AgentType agent_type = sample_agent(rng);
 
         constexpr double BUMP_BASE = 0.35;
-        const auto vs = state.vol_state();
-        const auto fs = state.flow_state();
-
-        const double absflow = std::abs(fs.flow_imbalance);
-
-        const double vol_s = vs.realised_vol_short;
-        const double vol_l = vs.realised_vol_long;
-        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-        const double stress_p = std::max(0.0, stress);
-        const double tox = 
-            0.8 * stress_p +
-            0.8 * absflow +
-            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
-
         // 0 below 0, 1 above 1
-        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
+        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (2.0 * state.toxicity01 - 1.0)));
         const double bump = (1.0 - gate) * BUMP_BASE / static_cast<double>(std::max((size_t)1, batch_size));
         switch (agent_type) {
             case AgentType::MAKER: agent_mix_state_.mm_boost    += bump; break;
@@ -90,46 +71,12 @@ public:
     }
 
     void update_intensity(
-        const SimulationState<N>& state,
+        const FeatureVector& state,
         size_t open_order_count,
         double& lambda_insert,
         double& lambda_cancel
     ) const {
-        const auto ts = state.time_state();
-        const auto ps = state.price_state();
-        const auto ls = state.liq_state();
-        const auto vs = state.vol_state();
-        const auto fs = state.flow_state();
-
-        const double dt = std::max(1e-9, (double)ts.time_since_previous_sync);
-
-        // ---- features ----
-        // Spread / thinness
-        const double spread = ps.spread ? (double)(*ps.spread) : 0.0;
-        const double spread_n = std::clamp(spread / 2.0, 0.0, 5.0); // "few ticks"
-
-        const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
-        const double depth_log = std::log1p(depth0);
-        const double thin = std::clamp(2.0 - depth_log, 0.0, 2.0); // higher => thinner
-
-        // Vol stress: short vs long
-        const double vol_s = std::max(1e-8, (double)vs.realised_vol_short);
-        const double vol_l = std::max(1e-8, (double)vs.realised_vol_long);
-        const double stress = std::clamp(std::log(vol_s / vol_l), -2.0, 2.0);
-        const double stress_p = std::max(0.0, stress);
-
-        // Trade-rate acceleration (dimensionless)
-        const double r_s = std::max(1e-8, (double)fs.trade_rate_ewma_short);
-        const double r_l = std::max(1e-8, (double)fs.trade_rate_ewma_long);
-        const double rate_ratio = std::clamp(r_s / r_l, 0.25, 4.0);
-        const double log_rate_ratio = std::log(rate_ratio);
-
-        // Flow / imbalance
-        const double absflow = std::abs(fs.flow_imbalance);
-
-        // Hawkes-like excitation (already bounded & decaying)
-        const double excite = std::clamp((double)fs.excitement, 0.0, 5.0);
-
+        const double dt = std::max(1e-9, (double)state.time_since_previous_sync);
         // META activity in [0,1] (drives both activity and churn)
         const double meta = std::clamp((double)meta_archetype_.activity(), 0.0, 1.0);
 
@@ -144,14 +91,14 @@ public:
         double log_li = std::log(LAMBDA_INSERT_BASE);
 
         // Drivers (tuned to be moderate; excite does most of the clustering work)
-        log_li += 0.40 * stress_p;          // stress => more updates/flow
-        log_li += 0.25 * log_rate_ratio;    // tape accelerating => more events
-        log_li += 0.18 * thin;              // thin book => more refill
-        log_li += 0.06 * spread_n;          // wide spread => some added activity
-        log_li += 0.55 * absflow;           // directional pressure => more events
+        log_li += 0.40 * state.stress01;                            // stress => more updates/flow
+        log_li += 0.25 * state.trade_rate01;                        // tape accelerating => more events
+        log_li += 0.18 * state.thin01;                              // thin book => more refill
+        log_li += 0.06 * state.spread01;                            // wide spread => some added activity
+        log_li += 0.55 * std::fabs(state.flow_imbalance);           // directional pressure => more events
 
         // Excitation is the main burst mechanism
-        log_li += 0.55 * excite;
+        log_li += 0.55 * state.excitement01;
 
         // Meta boosts event flow
         log_li += 0.90 * meta;
@@ -166,13 +113,14 @@ public:
         // Structure: cancellations scale with open orders, modulated by stress/excite/meta
         // Start from the baseline ratio implied by your constants:
         // at OPEN_TARGET, want lambda_cancel ≈ LAMBDA_CANCEL_BASE.
+        const double k1 = LAMBDA_CANCEL_BASE / 10.0;
         const double k0 = LAMBDA_CANCEL_BASE / std::max(1.0, OPEN_TARGET); // cancels/sec per open order at baseline
         double log_lc = std::log(k0 * std::max(1.0, (double)open_order_count));
 
         // Drivers: stress/excite increase churn; thinness decreases cancels (avoid draining when already thin)
-        log_lc += 0.75 * stress_p;
-        log_lc += 0.25 * log_rate_ratio;
-        log_lc += 0.85 * excite;     // strong: cancels cluster strongly in bursts
+        log_lc += 0.75 * state.stress01;
+        log_lc += 0.25 * state.trade_rate01;
+        log_lc += 0.85 * state.excitement01;     // strong: cancels cluster strongly in bursts
         log_lc += 0.60 * meta;
 
         // If book is too big vs target, cancel more; if too small, cancel less.
@@ -181,7 +129,7 @@ public:
 
         // Avoid draining a thin book during stress: makers often pull back, but if depth is already low,
         // too much cancel will create unrealistic empty-book behavior.
-        log_lc -= 0.25 * thin;
+        log_lc -= 0.25 * state.thin01;
 
         // Clamp target
         const double lc_target = std::clamp(std::exp(log_lc), 500.0, 1'200'000.0);
@@ -203,7 +151,7 @@ public:
     }
 
 
-    void sync_with_state(const SimulationState<N>& state, double lambda_insert, RNG* rng) {
+    void sync_with_state(const FeatureVector& state, double lambda_insert, RNG* rng) {
         meta_archetype_.update(state, rng);
         update_agent_mix(state, rng);
         set_agent_weights(state, lambda_insert);
@@ -213,69 +161,44 @@ public:
 
 private:
     inline void set_agent_weights(
-        const SimulationState<N>& state,
+        const FeatureVector& state,
         double lambda_insert
     ) {
         const double lambda_ratio = std::clamp(
             std::log((lambda_insert + 1e-6) / (LAMBDA_INSERT_BASE + 1e-6)),
             -1.5, 1.5
         );
-        const auto ps = state.price_state();
-        const auto ls = state.liq_state();
-        const auto vs = state.vol_state();
-        const auto fs = state.flow_state();
-
-        // Features
-        const double spread = ps.spread ? (double)(*ps.spread) : 0.0;
-        const double spread_n = std::clamp(spread / 2.0, 0.0, 5.0); // normalize to "a few ticks"
-
-        const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
-        const double depth_n = std::clamp(std::log(depth0 + 1.0), 0.0, 10.0);
-
-        const double absflow = std::abs(fs.flow_imbalance);
-
-        const double vol_s = vs.realised_vol_short;
-        const double vol_l = vs.realised_vol_long;
-        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-        const double stress_p = std::max(0.0, stress);
-
-        const double rate_n = std::clamp(fs.trade_rate_ewma_short / std::max(fs.trade_rate_ewma_long, 1e-6), 0.0, 3.0);
-        const double tox = 
-            0.8 * stress_p +
-            0.8 * absflow +
-            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
-
         // 0 below 0, 1 above 1
-        const double mm_gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
+        const double mm_gate = 1.0 / (1.0 + std::exp(-4.0 * (state.toxicity01 - 1.0)));
 
         // Interpret: higher logit => more likely
         double l_mm =
             2.50
-            - 0.6 * spread_n        // tight spread => MM more likely
-            + 0.2 * rate_n
+            - 0.6 * state.spread01        // tight spread => MM more likely
+            + 0.2 * state.trade_rate01
             - 3.0 * mm_gate
             - 0.40 * std::max(0.0, lambda_ratio);
 
         double l_taker =
             -0.80
-            + 0.25 * std::log1p(absflow)
-            + 0.15 * std::log1p(rate_n)
-            + 0.25 * stress_p 
-            - 0.35 * spread_n
-            + 0.24 * stress_p * spread_n // only in stressed markets does wide spread go with urgency
+            + 0.25 * std::fabs(state.flow_imbalance)
+            + 0.15 * state.trade_rate01
+            + 0.25 * state.stress01 
+            - 0.35 * state.spread01
+            + 0.24 * state.stress01 * state.spread01 // only in stressed markets does wide spread go with urgency
             + 0.2 * std::max(0.0, lambda_ratio);
 
         double l_deep =
             -0.10
-            + 0.6 * stress_p
-            + 0.4 * spread_n
-            - 0.2 * rate_n         // in very active tape, deep provision relatively less
+            + 0.6 * state.stress01
+            + 0.4 * state.spread01
+            - 0.2 * state.trade_rate01         // in very active tape, deep provision relatively less
             - 0.15 * lambda_ratio;
 
         double l_noise =
             0.10
-            + 0.1 * rate_n
-            - 0.1 * stress_p       // noise always there
+            + 0.1 * state.trade_rate01
+            - 0.1 * state.stress01       // noise always there
             - 0.25 * lambda_ratio;
 
         double l_meta = -4.0 + 6.0 * meta_archetype_.activity(); // essentially off unless episode model turns it on
@@ -290,11 +213,8 @@ private:
             case AgentType::META: break;
         }
 
-        // Optional: thin top-of-book => encourage MM/DEEP
-        // (Depth_n small means thin)
-        const double thin = std::clamp(2.0 - depth_n, 0.0, 2.0);
-        l_mm   += 0.3 * thin * (1.0 - 1.5 * mm_gate);
-        l_deep += 0.2 * thin;
+        l_mm   += 0.3 * state.thin01 * (1.0 - 1.5 * mm_gate);
+        l_deep += 0.2 * state.thin01;
 
         // Softmax sample
         const std::array<double, 5> L = {l_mm, l_taker, l_deep, l_noise, l_meta};
@@ -312,29 +232,14 @@ private:
         return;
     }
 
-    void update_agent_mix(const SimulationState<N>& state, RNG* rng) {
-        const auto fs = state.flow_state();
-        const auto vs = state.vol_state();
-        const double absflow = std::abs(fs.flow_imbalance);
-
-        const double vol_s = vs.realised_vol_short;
-        const double vol_l = vs.realised_vol_long;
-        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-        const double stress_p = std::max(0.0, stress);
-        const double tox = 
-            0.8 * stress_p +
-            0.8 * absflow +
-            0.4 * std::clamp(fs.excitement / 5.0, 0.0, 1.0);
-        
-
-        // 0 below 0, 1 above 1
-        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (tox - 1.0)));
+    void update_agent_mix(const FeatureVector& state, RNG* rng) {
+        const double gate = 1.0 / (1.0 + std::exp(-4.0 * (state.toxicity01 - 1.0)));
         constexpr double TAU_INERTIA_CALM = 0.2;
         constexpr double TAU_INERTIA_STRESS = 0.01;
 
         const double tau_inertia = TAU_INERTIA_CALM * (1.0 - 0.8 * gate) + TAU_INERTIA_STRESS * gate;
 
-        const double dt = state.time_state().time_since_previous_sync;
+        const double dt = state.time_since_previous_sync;
         const double a = 1.0 - std::exp(-dt / tau_inertia);
 
         agent_mix_state_.mm_boost *= (1.0 - a);
@@ -350,21 +255,37 @@ private:
         //     if (u <= agent_cdf_[i]) return static_cast<AgentType>(i);
         // }
         // return static_cast<AgentType>(agent_cdf_.size() - 1);
+        // MAKER = 0,
+        // TAKER = 1,
+        // DEEP = 2,
+        // NOISE = 3,
+        // META = 4
         const double u = rng->standard_uniform();
-        const double p_maker = agent_cdf_[0] / (agent_cdf_[0] + agent_cdf_[1] + 1e-6);
+        const double denom = 
+            agent_cdf_[0] 
+            + agent_cdf_[1] 
+            // + agent_cdf_[2] 
+            + 1e-6;
+        const double p_maker = agent_cdf_[0] / denom;
+        const double p_taker = agent_cdf_[0] / denom;
         if (u <= p_maker) {
             return AgentType::MAKER;
         } else {
             return AgentType::TAKER;
         }
+        // } else if (u <= p_maker + p_taker) {
+        //     return AgentType::TAKER;
+        // } else {
+        //     return AgentType::DEEP;
+        // }
     }
 
 
     private:
         AgentMixState agent_mix_state_;
-        MarketMakerAgent<N> mm_archetype_;
-        TakerAgent<N> taker_archetype_;
-        MetaAgent<N> meta_archetype_;
+        MarketMakerAgent mm_archetype_;
+        TakerAgent taker_archetype_;
+        MetaAgent meta_archetype_;
         DeepParams deep_params_;
         NoiseParams noise_params_;
         

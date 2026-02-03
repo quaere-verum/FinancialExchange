@@ -10,55 +10,7 @@
 #include "rng.hpp"
 #include "state.hpp"
 #include "util.hpp"
-
-
-
-struct MetaParams {
-    // Episode arrival model (hazard per second, then modulated by stress/rate)
-    double base_hazard_interval = 180.0; // mean time between episodes in calm markets
-    double hazard_stress_w = 0.7;        // increases start hazard with stress
-    double hazard_rate_w   = 0.4;        // increases start hazard with tape speed
-    double start_prob_cap  = 0.25;       // cap per-tick start probability
-
-    // Episode duration distribution
-    double mean_episode_time = 1.0;      // seconds, exponential
-
-    // Activity mapping: how strongly META dominates when active
-    double activity_when_active = 1.0;   // [0..1] (you can set <1 to soften dominance)
-    double activity_decay_tau = 0.12;    // seconds: smooth activity transitions a bit
-
-    // Placement aggressiveness
-    int max_sweep_ticks = 60;
-    int base_sweep_cap  = 12;
-
-    double p_geom_calm   = 0.70;  // shallow tail
-    double p_geom_urgent = 0.30;  // fatter tail (smaller p)
-
-    // If spread is huge and urgency not extreme, sometimes post passively to reduce cost.
-    double wide_spread_ticks = 6.0;
-    double p_passive_when_wide = 0.65;
-
-    // Size model
-    Volume_t min_qty = 1;
-    Volume_t max_qty = 5000;
-    double mean_qty  = 60.0;
-    double qty_sigma = 1.1;
-
-    double urgency_size_boost = 3.0; // mean multiplier: (1 + boost * urgency)
-    double surprise_size_boost = 0.8;
-
-    // Cancel/lifespan
-    double hazard_min = 0.02;
-    double hazard_max = 0.50;
-
-    // Side selection at episode start
-    double side_flow_w = 0.35; // p_buy = clamp(0.5 + w*flow, ...)
-    double side_pmin   = 0.10;
-    double side_pmax   = 0.90;
-
-    // Optional: reduce sweep cap when top-of-book is thin
-    double thin_cap_reduction = 0.4; // multiply cap by (1 - thin_cap_reduction*thin01)
-};
+#include "parameters.hpp"
 
 
 struct MetaState {
@@ -75,7 +27,6 @@ struct MetaState {
 };
 
 
-template <size_t N>
 class MetaAgent {
 public:
     explicit MetaAgent(MetaParams p = {}) : p_(p) {}
@@ -87,12 +38,8 @@ public:
     double activity() const { return std::clamp(s_.activity, 0.0, 1.0); }
 
     // Call once per tick (before set_agent_weights), using dt from SimulationState.
-    void update(const SimulationState<N>& state, RNG* rng) {
-        const auto ts = state.time_state();
-        const auto vs = state.vol_state();
-        const auto fs = state.flow_state();
-
-        const double dt = std::max(0.0, ts.time_since_previous_sync);
+    void update(const FeatureVector& state, RNG* rng) {
+        const double dt = std::max(0.0, state.time_since_previous_sync);
         if (dt <= 0.0) return;
 
         // Smooth activity (prevents hard on/off in weights if desired)
@@ -114,18 +61,9 @@ public:
             return;
         }
 
-        // Not active: hazard of starting an episode
-        // Stress proxy: log(vol_short / vol_long), positive part
-        const double vol_s = vs.realised_vol_short;
-        const double vol_l = vs.realised_vol_long;
-        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-
-        // Tape speed proxy: short/long trade-rate ratio if you have it; otherwise use ewma
-        double rate_n = std::clamp(fs.trade_rate_ewma_short / (fs.trade_rate_ewma_long + 1e-6), 0.0, 3.0);
-
         double hazard = 1.0 / std::max(1e-6, p_.base_hazard_interval);
-        hazard *= (1.0 + p_.hazard_stress_w * std::max(0.0, stress));
-        hazard *= (1.0 + p_.hazard_rate_w   * rate_n);
+        hazard *= (1.0 + p_.hazard_stress_w * std::max(0.0, state.stress01));
+        hazard *= (1.0 + p_.hazard_rate_w   * state.trade_rate01);
 
         const double p_start = std::clamp(hazard * dt, 0.0, p_.start_prob_cap);
         if (rng->standard_uniform() < p_start) {
@@ -135,16 +73,11 @@ public:
 
     // Generate a META insert. Call only when sampled as META.
     inline void decide_insert(
-        const SimulationState<N>& state, 
+        const FeatureVector& state, 
         double cumulative_hazard, 
         RNG* rng,
         std::vector<InsertDecision>& insert_decisions
     ) const {
-        const auto ps = state.price_state();
-        const auto ls = state.liq_state();
-        const auto vs = state.vol_state();
-        const auto fs = state.flow_state();
-
         // If somehow sampled while inactive, just act like a moderately aggressive taker.
         const Side side = s_.side;
 
@@ -153,8 +86,8 @@ public:
         const double urgency = std::clamp(1.0 - (s_.time_left / Tref), 0.0, 1.0);
 
         // Fallback if no BBO
-        if (!ps.best_bid || !ps.best_ask) {
-            const Price_t ref = ps.last_trade_price;
+        if (!state.has_bid_side || !state.has_ask_side) {
+            const Price_t ref = state.last_trade_price;
             const int k = std::min(5, p_.max_sweep_ticks);
             const Price_t px = (side == Side::BUY) ? (ref + (Price_t)(k))
                                                    : (ref - (Price_t)(k));
@@ -169,23 +102,9 @@ public:
             return;
         }
 
-        const Price_t bb = *ps.best_bid;
-        const Price_t ba = *ps.best_ask;
-        const double spread_ticks = (double)(ba - bb);
-
-        // Stress proxy again for aggressiveness scaling
-        const double vol_s = vs.realised_vol_short;
-        const double vol_l = vs.realised_vol_long;
-        const double stress = std::clamp(std::log((vol_s + 1e-8) / (vol_l + 1e-8)), -2.0, 2.0);
-        const double stress01 = std::clamp(std::max(0.0, stress) / 1.5, 0.0, 1.0);
-
-        // Thinness from top bucket depth
-        const double depth0 = (double)ls.bid_volumes[0] + (double)ls.ask_volumes[0];
-        const double thin01 = std::clamp(1.0 - std::log(depth0 + 1.0) / 6.0, 0.0, 1.0);
-
         // Passive fallback when spread is huge and urgency not extreme
         bool passive = false;
-        if (spread_ticks >= p_.wide_spread_ticks) {
+        if (state.spread >= p_.wide_spread_ticks) {
             const double p_passive = std::clamp(p_.p_passive_when_wide * (1.0 - 0.7 * urgency), 0.05, 0.95);
             passive = (rng->standard_uniform() < p_passive);
         }
@@ -194,39 +113,37 @@ public:
         if (!passive) {
             // Sweep cap: per-episode base + urgency/stress scaling; reduced when thin.
             int cap = s_.sweep_cap_ticks > 0 ? s_.sweep_cap_ticks : p_.base_sweep_cap;
-            cap = (int)std::llround(cap * (1.0 + 2.0 * urgency + 0.8 * stress01));
+            cap = (int)std::llround(cap * (1.0 + 2.0 * urgency + 0.8 * state.stress01));
             cap = std::clamp(cap, 1, p_.max_sweep_ticks);
-            cap = (int)std::llround(cap * (1.0 - p_.thin_cap_reduction * thin01));
+            cap = (int)std::llround(cap * (1.0 - p_.thin_cap_reduction * state.thin01));
             cap = std::clamp(cap, 1, p_.max_sweep_ticks);
 
             // Geometric parameter interpolated by urgency (urgent => smaller p => fatter tail)
             const double p_geom = p_.p_geom_calm + (p_.p_geom_urgent - p_.p_geom_calm) * urgency;
             const int k = sample_geometric_offset(rng, p_geom, cap);
 
-            px = (side == Side::BUY) ? (ba + (Price_t)(k))
-                                     : (bb - (Price_t)(k));
+            px = (side == Side::BUY) ? (*state.best_ask + (Price_t)(k))
+                                     : (*state.best_bid - (Price_t)(k));
         } else {
             // Passive: join best, sometimes improve by 1 tick if spread allows and urgency moderate
             if (side == Side::BUY) {
-                px = bb;
-                if (spread_ticks >= 2.0 && rng->standard_uniform() < (0.15 + 0.25 * urgency)) {
-                    px = bb + 1;
+                px = *state.best_bid;
+                if (state.spread >= 2.0 && rng->standard_uniform() < (0.15 + 0.25 * urgency)) {
+                    px = *state.best_bid + 1;
                 }
             } else {
-                px = ba;
-                if (spread_ticks >= 2.0 && rng->standard_uniform() < (0.15 + 0.25 * urgency)) {
-                    px = ba - 1;
+                px = *state.best_ask;
+                if (state.spread >= 2.0 && rng->standard_uniform() < (0.15 + 0.25 * urgency)) {
+                    px = *state.best_ask - 1;
                 }
             }
         }
 
-        // Size: heavy tail + urgency + volume surprise
-        const double surp01 = std::clamp(fs.volume_surprise, 0.0, 2.0) / 2.0;
         double mean = p_.mean_qty * s_.size_scale
                     * (1.0 + p_.urgency_size_boost * urgency)
-                    * (1.0 + p_.surprise_size_boost * surp01);
+                    * (1.0 + p_.surprise_size_boost * std::max(state.surprise_signx01, 0.0));
 
-        if (spread_ticks >= p_.wide_spread_ticks && !passive && urgency < 0.5) mean *= 0.6;
+        if (state.spread >= p_.wide_spread_ticks && !passive && urgency < 0.5) mean *= 0.6;
 
         const double z = rng->standard_normal();
         const double base = std::max(1e-6, p_.mean_qty);
@@ -245,16 +162,14 @@ public:
     }
 
 private:
-    void start_episode_(const SimulationState<N>& state, RNG* rng) {
-        const auto fs = state.flow_state();
-
+    void start_episode_(const FeatureVector& state, RNG* rng) {
         s_.active = true;
 
         // Duration
         s_.time_left = rng->exponential(1.0 / std::max(1e-6, p_.mean_episode_time));
 
         // Side from flow imbalance (directional)
-        const double flow = std::clamp(fs.flow_imbalance, -1.0, 1.0);
+        const double flow = std::clamp(state.flow_imbalance, -1.0, 1.0);
         const double p_buy = std::clamp(0.5 + p_.side_flow_w * flow, p_.side_pmin, p_.side_pmax);
         s_.side = (rng->standard_uniform() < p_buy) ? Side::BUY : Side::SELL;
 

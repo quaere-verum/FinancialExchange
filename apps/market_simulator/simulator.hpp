@@ -138,8 +138,9 @@ class MarketSimulator {
                     last_tick_ = t0;
                     order_manager_.update_cancel_rate(lambda_cancel_);
                     state_.sync_with_book(shadow_order_book_, dt);
-                    dynamics_.update_intensity(state_, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
-                    dynamics_.sync_with_state(state_, lambda_insert_, rng_.get());
+                    const FeatureVector& state = state_.get_features();
+                    dynamics_.update_intensity(state, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
+                    dynamics_.sync_with_state(state, lambda_insert_, rng_.get());
 
                     const auto out_depth = outbound_->size_approx();
                     if (!outbound_paused_ && out_depth >= HIGH_OUTBOUND_Q_SIZE) {
@@ -158,7 +159,7 @@ class MarketSimulator {
                     const double mean = lambda_insert_ * dt;
                     const std::uint32_t k = rng_->poisson(mean);
 
-                    generate_inserts(k);
+                    generate_inserts(state, k);
 
                     // const auto t1 = std::chrono::steady_clock::now();
                     // handler_ns_accum_ += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -243,14 +244,14 @@ class MarketSimulator {
         }
 
 
-        void generate_inserts(size_t batch_size) {
+        void generate_inserts(const FeatureVector& state, size_t batch_size) {
             size_t inserts_sent = 0;
 
             while (inserts_sent < batch_size) {
                 insert_decisions_.clear();
 
                 dynamics_.decide_insert(
-                    state_,
+                    state,
                     order_manager_.cumulative_hazard(),
                     batch_size,
                     rng_.get(),
@@ -304,7 +305,7 @@ class MarketSimulator {
         bool outbound_paused_{false};
 
         ShadowOrderBook shadow_order_book_;
-        MarketDynamics<N> dynamics_;
+        MarketDynamics dynamics_;
         SimulationState<N> state_;
         OrderManager order_manager_;
 
