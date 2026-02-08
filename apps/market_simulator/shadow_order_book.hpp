@@ -30,7 +30,7 @@ class ShadowOrderBook {
                 levels.erase(update->price);
             } else {
                 levels[update->price] = update->total_volume;
-            }               
+            }
         }
 
         inline std::optional<Price_t> best_bid_price() const {

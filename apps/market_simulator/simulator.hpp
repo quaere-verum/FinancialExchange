@@ -43,6 +43,7 @@ class MarketSimulator {
         , request_id_(0)
         // , metrics_timer_(context)
         , order_manager_(sim_strand_, connection_, request_id_) {
+            insert_decisions_.reserve(MM_LADDER_SIZE);
             connection_.large_message_received = [this](Id_t cid, Message_t type, std::shared_ptr<std::vector<uint8_t>> buf) {
                 this->on_large_message(cid, type, buf);
             };
@@ -66,6 +67,10 @@ class MarketSimulator {
             running_.store(true, std::memory_order_release);
             // start_metrics_();
             connection_.async_read();
+            connection_.send_message(
+                static_cast<Message_t>(MessageType::SUBSCRIBE),
+                &make_subscribe(request_id_++)
+            );
             boost::asio::post(sim_strand_, [this]{
                 last_tick_ = std::chrono::steady_clock::now();
                 schedule_tick(); 
@@ -100,6 +105,7 @@ class MarketSimulator {
         //                 << " inserts_sent/s=" << inserts_sent_
         //                 << " inbound_processed/s=" << inbound_msgs_processed_
         //                 << " inbound_backlog_max=" << inbound_backlog_max_
+        //                 << " open_orders=" << order_manager_.open_order_count()
         //                 << "\n";
 
         //             // reset per-second counters
@@ -130,9 +136,11 @@ class MarketSimulator {
                     if (dt < 0.0) dt = 0.0;
                     if (dt > 0.25) dt = 0.25;
                     last_tick_ = t0;
-                    state_.sync_with_book(shadow_order_book_, dt);
                     order_manager_.update_cancel_rate(lambda_cancel_);
-                    dynamics_.update_intensity(state_, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
+                    state_.sync_with_book(shadow_order_book_, dt);
+                    const FeatureVector& state = state_.get_features();
+                    dynamics_.update_intensity(state, order_manager_.open_order_count(), lambda_insert_, lambda_cancel_);
+                    dynamics_.sync_with_state(state, lambda_insert_, rng_.get());
 
                     const auto out_depth = outbound_->size_approx();
                     if (!outbound_paused_ && out_depth >= HIGH_OUTBOUND_Q_SIZE) {
@@ -151,9 +159,7 @@ class MarketSimulator {
                     const double mean = lambda_insert_ * dt;
                     const std::uint32_t k = rng_->poisson(mean);
 
-                    for (std::uint32_t i = 0; i < k; ++i) {
-                        generate_insert();
-                    }
+                    generate_inserts(state, k);
 
                     // const auto t1 = std::chrono::steady_clock::now();
                     // handler_ns_accum_ += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -174,7 +180,7 @@ class MarketSimulator {
             }
             // inbound_msgs_processed_ += n;
 
-            // const auto backlog = inbound_.size_approx();
+            // const auto backlog = inbound_->size_approx();
             // if (backlog > inbound_backlog_max_) inbound_backlog_max_ = backlog;
         }
 
@@ -238,23 +244,43 @@ class MarketSimulator {
         }
 
 
-        void generate_insert() {
-            Id_t request_id = request_id_++;
-            InsertDecision insert = dynamics_.decide_insert(state_, order_manager_.cumulative_hazard(), rng_.get());
-            PayloadInsertOrder payload = make_insert_order(
-                request_id,
-                insert.side,
-                insert.price,
-                insert.quantity,
-                insert.lifespan
-            );
-            order_manager_.register_pending_insert(request_id, insert.cancellation_hazard_mass);
-            connection_.send_message(
-                static_cast<Message_t>(MessageType::INSERT_ORDER),
-                &payload
-            );
-            // inserts_sent_ += 1;
+        void generate_inserts(const FeatureVector& state, size_t batch_size) {
+            size_t inserts_sent = 0;
+
+            while (inserts_sent < batch_size) {
+                insert_decisions_.clear();
+
+                dynamics_.decide_insert(
+                    state,
+                    order_manager_.cumulative_hazard(),
+                    batch_size,
+                    rng_.get(),
+                    insert_decisions_
+                );
+
+                for (const auto& insert : insert_decisions_) {
+                    Id_t request_id = request_id_++;
+
+                    PayloadInsertOrder payload = make_insert_order(
+                        request_id,
+                        insert.side,
+                        insert.price,
+                        insert.quantity,
+                        insert.lifespan
+                    );
+
+                    order_manager_.register_pending_insert(request_id, insert.cancellation_hazard_mass);
+
+                    connection_.send_message(
+                        static_cast<Message_t>(MessageType::INSERT_ORDER),
+                        &payload
+                    );
+
+                    ++inserts_sent;
+                }
+            }
         }
+
 
 
     private:
@@ -279,9 +305,11 @@ class MarketSimulator {
         bool outbound_paused_{false};
 
         ShadowOrderBook shadow_order_book_;
-        MarketDynamics<N> dynamics_;
+        MarketDynamics dynamics_;
         SimulationState<N> state_;
         OrderManager order_manager_;
+
+        std::vector<InsertDecision> insert_decisions_;
 
         // // metrics
         // boost::asio::steady_timer metrics_timer_;
